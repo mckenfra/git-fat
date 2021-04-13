@@ -522,10 +522,11 @@ class GitFat(object):
         '''
         digest, bytes = self.decode(body, noraise=True)
         return digest
-    def filter_clean(self, instream, outstreamclean, filename):
+    def filter_clean(self, instream, outstreamclean, filename=None):
         h = hashlib.new('sha1')
         bytes = 0
         fd, tmpname = tempfile.mkstemp(dir=self.objdir)
+        filenameSuffix = ' "%s"' % filename if filename else ''
         try:
             ishanging = False
             cached = False                # changes to True when file is cached
@@ -546,42 +547,50 @@ class GitFat(object):
             objfile = os.path.join(self.objdir, digest)
             if not ishanging:
                 if os.path.exists(objfile):
-                    self.verbose('git-fat filter-clean: cache already exists %s => "%s"' % (objfile, filename))
+                    self.verbose('git-fat filter-clean: cache already exists %s%s' % (objfile, filenameSuffix))
                     os.remove(tmpname)
-#                     self.verbose('%s => %s' % (filename, self.encode(digest, bytes)))
                 else:
                     # Set permissions for the new file using the current umask
                     os.chmod(tmpname, int('444', 8) & ~umask())
                     os.rename(tmpname, objfile)
-                    self.verbose('git-fat filter-clean: caching to %s => "%s"' % (objfile. filename))
+                    self.verbose('git-fat filter-clean: caching to %s%s' % (objfile, filenameSuffix))
                 cached = True
                 outstreamclean.write(self.encode(digest, bytes))
         finally:
             if not cached:
                 os.remove(tmpname)
 
-    def cmd_filter_clean(self, filename):
+    def cmd_filter_clean(self, filename=None):
         '''
         The clean filter runs when a file is added to the index. It gets the "smudged" (tree)
         version of the file on stdin and produces the "clean" (repository) version on stdout.
         '''
-        self.setup()
-        self.filter_clean(sys.stdin, sys.stdout, filename)
+        try:
+            self.setup()
+            self.filter_clean(sys.stdin, sys.stdout, filename)
+        except:
+            e = sys.exc_info()[0]
+            verbose_stderr('[git-fat] Error: %s' % e)
 
-    def cmd_filter_smudge(self, filename):
-        self.setup()
-        result, bytes = self.decode_stream(sys.stdin)
-        if isinstance(result, str):       # We got a digest
-            objfile = os.path.join(self.objdir, result)
-            try:
-                cat(open(objfile), sys.stdout)
-                self.verbose('git-fat filter-smudge: restoring from %s => %s' % (objfile, filename))
-            except IOError:                 # file not found
-                self.verbose('git-fat filter-smudge: fat object missing %s => %s' % (objfile, filename))
-                sys.stdout.write(self.encode(result, bytes))   # could leave a better notice about how to recover this file
-        else:                             # We have an iterable over the original input.
-            self.verbose('git-fat filter-smudge: not a managed file "%s"' % filename)
-            cat_iter(result, sys.stdout)
+    def cmd_filter_smudge(self, filename=None):
+        try:
+            self.setup()
+            result, bytes = self.decode_stream(sys.stdin)
+            filenameSuffix = ' "%s"' % filename if filename else ''
+            if isinstance(result, str):       # We got a digest
+                objfile = os.path.join(self.objdir, result)
+                try:
+                    cat(open(objfile), sys.stdout)
+                    self.verbose('git-fat filter-smudge: restoring from %s%s' % (objfile, filenameSuffix))
+                except IOError:                 # file not found
+                    self.verbose('git-fat filter-smudge: fat object missing %s%s' % (objfile, filenameSuffix))
+                    sys.stdout.write(self.encode(result, bytes))   # could leave a better notice about how to recover this file
+            else:                             # We have an iterable over the original input.
+                self.verbose('git-fat filter-smudge: not a managed file%s' % filenameSuffix)
+                cat_iter(result, sys.stdout)
+        except:
+            e = sys.exc_info()[0]
+            verbose_stderr('[git-fat] Error: %s' % e)
     def catalog_objects(self):
         return set(os.listdir(self.objdir))
     def referenced_objects(*args):
