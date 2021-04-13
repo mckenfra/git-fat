@@ -340,7 +340,7 @@ class StatusWithFiles(object):
                     else:
                         file = obj = None
                 elif i == 2:
-                    if file and part == 'fat':
+                    if file and (part == 'fat' or not self.fat_files_only):
                         existing = self.obj2file[obj] if obj in self.obj2file else None
                         if existing:
                             if isinstance(existing, list):
@@ -362,7 +362,7 @@ class StatusWithFiles(object):
             self.did_get_referenced_file(fat, files)
     def did_get_referenced_file(self, fat, file):
         self.print_fat('fat', fat, file)
-        self.fatFiles.add(file)
+        self.fat_files.add(file)
     def run(self):
         dirs = set()
         files = set()
@@ -374,8 +374,9 @@ class StatusWithFiles(object):
         for dir in dirs:
             self.run_with_files(set(dir), is_dir=True)
     def run_with_files(self, files, is_dir=False): #dir=None):
-        self.fatFiles = set()
+        self.fat_files = set()
         self.obj2file = dict()
+        self.fat_files_only = is_dir
         pipe = self.fat.pipe_filter_referenced_objects(Pipe([
             Pipe.Process(['git','ls-files','-s','-z'] + list(files)),
             Pipe.Process('git check-attr --stdin -z filter'),
@@ -388,7 +389,7 @@ class StatusWithFiles(object):
         file2obj = dict([
             files2objs for fileOrFiles2obj in ((self.obj2file[obj],obj) for obj in self.obj2file.keys()) for files2objs in (((file,fileOrFiles2obj[1]) for file in fileOrFiles2obj[0]) if isinstance(fileOrFiles2obj[0], list) else [fileOrFiles2obj])
         ])
-        unmatched = (foundFiles if is_dir else files) - self.fatFiles
+        unmatched = (foundFiles if is_dir else files) - self.fat_files
         for file in unmatched:
           if file not in foundFiles:
               self.print_error('not a git object', file)
