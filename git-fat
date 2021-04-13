@@ -593,10 +593,10 @@ class GitFat(object):
             verbose_stderr('[git-fat] Error: %s' % e)
     def catalog_objects(self):
         return set(os.listdir(self.objdir))
-    def referenced_objects(*args):
+    def referenced_objects(self, rev=None, all=False, filter=None):
         referenced = set()
         add_to_referenced = Pipe.Output(lambda line : referenced.add(line.split()[0]))
-        pipe = self.pipe_referenced_objects(args).append(add_to_referenced)
+        pipe = self.pipe_referenced_objects(rev, all, filter).append(add_to_referenced)
         pipe.start().wait()
         return referenced
 
@@ -618,7 +618,7 @@ class GitFat(object):
 
         return self.pipe_filter_referenced_objects(Pipe([
             # Revision list gives us object names to inspect with cat-file
-            Pipe.Process('git rev-list --objects ' + rev),
+            Pipe.Process(['git','rev-list','--objects',rev]),
             # Extract hash
             Pipe.Handler(cut_sha1hash)
         ]))
