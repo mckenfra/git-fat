@@ -131,14 +131,14 @@ class Pipe(object):
   class Process(object):
       def __init__(self, command):
           self.command = command.split() if isinstance(command, str) else command
-          self.input = self.output = None
-      def start(self, isFirst, isLast, input=None):
-          stdin = input if input else None if isFirst else subprocess.PIPE
+      name = property(lambda self : ' '.join(self.command))
+      stdin = property(lambda self : self.process.stdin if self.process else None)
+      stdout = property(lambda self : self.process.stdout if self.process else None)
+      def pipefrom(self, isFirst, isLast, stdin=None):
+          if not stdin and not isFirst:
+              stdin = subprocess.PIPE
           self.process = subprocess.Popen(self.command, stdin=stdin, stdout=subprocess.PIPE)
-          self.input = self.process.stdin
-          self.output = self.process.stdout
-          return True
-      def restart(self, output=None):
+      def pipeinto(self, isFirst, isLast, output=None):
           pass
       def wait(self):
           if self.process:
@@ -150,29 +150,35 @@ class Pipe(object):
           self.target = target
           self.noInput = noInput
           if not noInput:
-              self.stdin = None
+              self._stdin = None
           self.thread = None
-      input = property(lambda self : None)
-      output = property(lambda self : None)
-      def start(self, isFirst, isLast, input=None):
+      name = property(lambda self : self.target.__name__)
+      stdin = property(lambda self : None)
+      stdout = property(lambda self : None)
+      def pipefrom(self, isFirst, isLast, stdin=None):
           if self.noInput:
-              return False
-          elif input:
-              self.stdin = input
-              return False
+              pass
+          elif stdin:
+              self._stdin = stdin
           else:
-              raise Pipe.Error('Handler must follow a step that produces an output - ' + self.target.__name__)
-      def restart(self, output=None):
-          if output:
-              args = (output) if self.noInput else (self.stdin, output)
+              raise Pipe.Error('Input stream missing - ' + self.name)
+      def pipeinto(self, isFirst, isLast, stdout=None):
+          if stdout:
+              if self.noInput:
+                  args = (stdout)
+              else:
+                  args = (self._stdin, stdout)
               self.thread = threading.Thread(target=self.target, args=args)
               self.thread.start()
+          elif isLast:
+              self.target() if self.noInput else self.target(self._stdin)
           else:
-              self.target() if self.noInput else self.target(self.stdin)
+              raise Pipe.Error('Output stream missing - ' + self.name)
       def wait(self):
           if self.thread:
               self.thread.join()
 
+  # Pipe step - pipes output of previous step to a target
   class Output(object):
       class Buffer(object):
           def __init__(self):
@@ -186,60 +192,60 @@ class Pipe(object):
 
       def __init__(self, target):
           self.target = target
-          self.stdout = Pipe.Output.Buffer()
-      input = property(lambda self : self)
-      output = property(lambda self : None)
-      def start(self, isFirst, isLast, input=None):
-          return False
-      def restart(self, output=None):
-          if output:
-              result = self.stdout.buffer
-              if result:
-                  output.write(result)
-              self.stdout = output
+          self._stdout = Pipe.Output.Buffer()
+      name = property(lambda self : self.target.__name__)
+      stdin = property(lambda self : self)
+      stdout = property(lambda self : None)
+      def pipefrom(self, isFirst, isLast, stdin=None):
+          pass
+      def pipeinto(self, isFirst, isLast, stdout=None):
+          if stdout:
+              data = self._stdout.buffer
+              if data:
+                  stdout.write(data)
+              self._stdout = stdout
       def wait(self):
           pass
+      # Pretend to be an outputstream
       def write(self, text):
-          result = self.target(text)
-          if result is not None:
-              self.stdout.write(result)
+          data = self.target(text)
+          if data is not None:
+              self._stdout.write(data)
       def close(self):
-          self.stdout.close()
+          self._stdout.close()
 
   # Pipe
   def __init__(self, steps):
       self.steps = steps
-      self.input = self.output = self.notStarted = None
+  name = property(lambda self : 'Pipe %i steps' % len(self.steps))
+  stdin = property(lambda self : self.steps[0].stdin if len(self.steps) > 0 else None)
+  stdout = property(lambda self : self.steps[-1].stdin if len(self.steps) > 0 else None)
   def append(self, step):
       self.steps.append(step)
       return self
-  def start(self, isFirst=True, isLast=True, input=None):
-    i = 0
-    for step in self.steps:
-        stepIsFirst = i == 0
-        stepIsLast = i == len(self.steps)-1
-        if step.start(stepIsFirst and isFirst, stepIsLast and isLast, self.output):
-            if self.notStarted:
-                self.notStarted.restart(step.input)
-            self.notStarted = None
-        else:
-            if self.notStarted:
-                if step.input:
-                    self.notStarted.restart(step.input)
-                else:
-                    raise Pipe.Error('Invalid steps')
-            self.notStarted = step
-        if stepIsFirst:
-            self.input = step.input
-        self.output = step.output
-        i += 1
-    if self.notStarted and isLast:
-        self.notStarted.restart(None)
-        self.notStarted = None
-    return False if self.notStarted else self  # So can do .start().wait()
-  def restart(self, output=None):
-      if self.notStarted:
-          self.notStarted.restart(output)
+  def start(self):
+      self.pipefrom(True, True, None)
+      return self # So can do .start().wait()
+  def pipefrom(self, isFirst, isLast, stdin=None):
+      self._iFirst = 0 if isFirst else -1
+      self._iLast = len(self.steps)-1 if isLast else -1
+      self._stdin = stdin
+      for i in range(0, len(self.steps)):
+          self.step_pipefrom(i)
+          if i > 0:
+              self.step_pipeinto(i-1)
+      if isLast:
+          self.pipeinto(isFirst, isLast, None)
+  def pipeinto(self, isFirst, isLast, stdout=None):
+      self._stdout = stdout
+      if len(self.steps) > 0:
+          self.step_pipeinto(len(self.steps)-1)
+  def step_pipefrom(self, i):
+      stdin = self._stdin if i <= 0 else self.steps[i-1].stdout
+      self.steps[i].pipefrom(i == self._iFirst, i == self._iLast, stdin)
+  def step_pipeinto(self, i):
+      stdout = self._stdout if i >= len(self.steps)-1 else self.steps[i+1].stdin
+      self.steps[i].pipeinto(i == self._iFirst, i == self._iLast, stdout)
   def wait(self):
       for step in self.steps:
           step.wait()
