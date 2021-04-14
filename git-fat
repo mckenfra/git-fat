@@ -303,6 +303,7 @@ class StatusNoFiles(object):
             for fat in fathashes:
                 print(indent + fat)
     def load_catalog(self):
+        self.catalog = set()
         self.catalog = self.fat.catalog_objects()
     def handle_referenced(self, line):
         fat, obj = line.split()
@@ -574,32 +575,23 @@ class GitFat(object):
         The clean filter runs when a file is added to the index. It gets the "smudged" (tree)
         version of the file on stdin and produces the "clean" (repository) version on stdout.
         '''
-        try:
-            self.setup()
-            self.filter_clean(sys.stdin, sys.stdout, filename)
-        except:
-            e = sys.exc_info()[0]
-            verbose_stderr('[git-fat] Error: %s' % e)
-
+        self.setup()
+        self.filter_clean(sys.stdin, sys.stdout, filename)
     def cmd_filter_smudge(self, filename=None):
-        try:
-            self.setup()
-            result, bytes = self.decode_stream(sys.stdin)
-            filenameSuffix = ' "%s"' % filename if filename else ''
-            if isinstance(result, str):       # We got a digest
-                objfile = os.path.join(self.objdir, result)
-                try:
-                    cat(open(objfile), sys.stdout)
-                    self.verbose('git-fat filter-smudge: restoring from %s%s' % (objfile, filenameSuffix))
-                except IOError:                 # file not found
-                    self.verbose('git-fat filter-smudge: fat object missing %s%s' % (objfile, filenameSuffix))
-                    sys.stdout.write(self.encode(result, bytes))   # could leave a better notice about how to recover this file
-            else:                             # We have an iterable over the original input.
-                self.verbose('git-fat filter-smudge: not a managed file%s' % filenameSuffix)
-                cat_iter(result, sys.stdout)
-        except:
-            e = sys.exc_info()[0]
-            verbose_stderr('[git-fat] Error: %s' % e)
+        self.setup()
+        result, bytes = self.decode_stream(sys.stdin)
+        filenameSuffix = ' "%s"' % filename if filename else ''
+        if isinstance(result, str):       # We got a digest
+            objfile = os.path.join(self.objdir, result)
+            try:
+                cat(open(objfile), sys.stdout)
+                self.verbose('git-fat filter-smudge: restoring from %s%s' % (objfile, filenameSuffix))
+            except IOError:                 # file not found
+                self.verbose('git-fat filter-smudge: fat object missing %s%s' % (objfile, filenameSuffix))
+                sys.stdout.write(self.encode(result, bytes))   # could leave a better notice about how to recover this file
+        else:                             # We have an iterable over the original input.
+            self.verbose('git-fat filter-smudge: not a managed file%s' % filenameSuffix)
+            cat_iter(result, sys.stdout)
     def catalog_objects(self):
         return set(os.listdir(self.objdir))
     def referenced_objects(self, rev=None, all=False, filter=None):
@@ -914,31 +906,44 @@ class GitFat(object):
         lsfiles.wait()
         updateindex.wait()
 
-
-if __name__ == '__main__':
+def main(*args):
     fat = GitFat()
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ''
+    cmd = args[0] if len(args) > 0 else ''
     if cmd == 'filter-clean':
-        fat.cmd_filter_clean(sys.argv[2])
+        fat.cmd_filter_clean(args[1] if len(args) > 1 else None)
     elif cmd == 'filter-smudge':
-        fat.cmd_filter_smudge(sys.argv[2])
+        fat.cmd_filter_smudge(args[1] if len(args) > 1 else None)
     elif cmd == 'init':
         fat.cmd_init()
     elif cmd == 'status':
-        fat.cmd_status(sys.argv[2:])
+        fat.cmd_status(args[1:])
     elif cmd == 'push':
-        fat.cmd_push(sys.argv[2:])
+        fat.cmd_push(args[1:])
     elif cmd == 'pull':
-        fat.cmd_pull(sys.argv[2:])
+        fat.cmd_pull(args[1:])
     elif cmd == 'gc':
         fat.cmd_gc()
     elif cmd == 'verify':
         fat.cmd_verify()
     elif cmd == 'checkout':
-        fat.cmd_checkout(sys.argv[2:])
+        fat.cmd_checkout(args)
     elif cmd == 'find':
-        fat.cmd_find(sys.argv[2:])
+        fat.cmd_find(args)
     elif cmd == 'index-filter':
-        fat.cmd_index_filter(sys.argv[2:])
+        fat.cmd_index_filter(args)
     else:
-        print('Usage: git fat [init|status|push|pull|gc|verify|checkout|find|index-filter]', file=sys.stderr)
+        print('Usage: git fat [init|status|push|pull|gc|verify|checkout|find|index-filter] [--verbose]', file=sys.stderr)
+
+if __name__ == '__main__':
+    cmd, verbose, args = (sys.argv[1], '--verbose' in sys.argv, [arg for arg in sys.argv[2:] if arg != '--verbose']) if len(sys.argv) > 1 else ('', False, [])
+    if not verbose:
+        verbose = os.environ.get('GIT_FAT_VERBOSE')
+    if verbose:
+        main(cmd, *args)
+    else:
+        try:
+            main(cmd, *args)
+        except Exception, e:
+            prefix = '[git-fat] ' if cmd == 'filter-clean' or cmd == 'filter-smudge' else ''
+            print('%s%s' % (prefix, e), file=sys.stderr)
+            sys.exit(1)
