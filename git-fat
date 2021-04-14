@@ -367,7 +367,9 @@ class StatusWithFiles(object):
         else:
             self.did_get_referenced_file(fat, files)
     def did_get_referenced_file(self, fat, file):
-        self.print_fat('fat', fat, file)
+        fatfile = os.path.join(self.fat.objdir, fat)
+        status = 'fat' if os.path.exists(fatfile) else 'orphan'
+        self.print_fat(status, fat, file)
         self.fat_files.add(file)
     def run(self):
         dirs = set()
