@@ -286,8 +286,9 @@ class StatusNoFiles(object):
                         splits = line.split(None, 1)
                         if len(splits) == 2 and splits[0] in self.obj2fat:
                             fat = self.obj2fat[splits[0]]
-                            self.print_fat_with_filename(fat, indent, splits[0], splits[1].rstrip())
-                            found.add(fat)
+                            if fat in fathashes:
+                                self.print_fat_with_filename(fat, indent, splits[0], splits[1].rstrip())
+                                found.add(fat)
                 Pipe([
                     Pipe.Process('git rev-list --objects --all'),
                     Pipe.Handler(print_matches)
