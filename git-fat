@@ -123,132 +123,111 @@ def gitconfig_set(name, value, file=None):
     args += [name, value]
     p = subprocess.check_call(args)
 
-# Easily connect a list of processes / handlers using pipes, and wait for entire pipe to finish
-class Pipe(object):
-  Error = RuntimeError
+class Pipeline(object):
+    class Devnull(object):
+        def write(self, x): pass
+        def close(self): pass
 
-  # Pipe step - launches a process
-  class Process(object):
-      def __init__(self, command):
-          self.command = command.split() if isinstance(command, str) else command
-      name = property(lambda self : ' '.join(self.command))
-      stdin = property(lambda self : self.process.stdin if self.process else None)
-      stdout = property(lambda self : self.process.stdout if self.process else None)
-      def pipefrom(self, isFirst, isLast, stdin=None):
-          if not stdin and not isFirst:
-              stdin = subprocess.PIPE
-          self.process = subprocess.Popen(self.command, stdin=stdin, stdout=subprocess.PIPE)
-      def pipeinto(self, isFirst, isLast, output=None):
-          pass
-      def wait(self):
-          if self.process:
-              self.process.wait()
+    class Target(object):
+        def should_start_before_next(self, next_process): return True
+        def should_start_after_next(self, next_process): return False
+        def start(self): pass
+        def wait(self): pass
+        def get_stdin(self): return None
+        def get_stdout(self): return None
+        stdin = property(lambda self : self.get_stdin())
+        stdout = property(lambda self : self.get_stdout())
 
-  # Pipe step - converts/filters output of process_1 to input of process_2
-  class Handler(object):
-      def __init__(self, target, noInput=False):
-          self.target = target
-          self.noInput = noInput
-          if not noInput:
-              self._stdin = None
-          self.thread = None
-      name = property(lambda self : self.target.__name__)
-      stdin = property(lambda self : None)
-      stdout = property(lambda self : None)
-      def pipefrom(self, isFirst, isLast, stdin=None):
-          if self.noInput:
-              pass
-          elif stdin:
-              self._stdin = stdin
-          else:
-              raise Pipe.Error('Input stream missing - ' + self.name)
-      def pipeinto(self, isFirst, isLast, stdout=None):
-          if stdout:
-              if self.noInput:
-                  args = (stdout)
-              else:
-                  args = (self._stdin, stdout)
-              self.thread = threading.Thread(target=self.target, args=args)
-              self.thread.start()
-          elif isLast:
-              self.target() if self.noInput else self.target(self._stdin)
-          else:
-              raise Pipe.Error('Output stream missing - ' + self.name)
-      def wait(self):
-          if self.thread:
-              self.thread.join()
+    class Popen(Target):
+        def __init__(self, command):
+            self.command = command.split() if isinstance(command, str) else command
+            self.process = None
+        def start(self, prev_process, next_process):
+            if prev_process:
+                if prev_process.stdout:
+                    stdin = prev_process.stdout
+                else:
+                    stdin = subprocess.PIPE
+            else:
+                stdin = None
+            self.process = subprocess.Popen(self.command, stdin=stdin, stdout=subprocess.PIPE)
+        def wait(self):
+            if self.process: self.process.wait()
+        def get_stdin(self): return self.process.stdin if self.process else None
+        def get_stdout(self): return self.process.stdout if self.process else None
+        def __str__(self): return ' '.join(self.command)
 
-  # Pipe step - pipes output of previous step to a target
-  class Output(object):
-      class Buffer(object):
-          def __init__(self):
-              self.buffer = None
-          def write(self, text):
-              if not self.buffer:
-                  self.buffer = ''
-              self.buffer += result
-          def close(self):
-              pass
+    class FilterOutput(Target):
+        def __init__(self, target):
+            self.target = target
+            self.thread = None
+        def should_start_before_next(self, next_process): return not next_process
+        def should_start_after_next(self, next_process): return next_process
+        def start(self, prev_process, next_process):
+            stdin = prev_process.stdout
+            if next_process:
+                stdout = next_process.stdin
+            else:
+                stdout = Pipeline.Devnull()
+            self.thread = threading.Thread(target=self.target, args=(stdin, stdout))
+            self.thread.start()
+        def wait(self):
+            if self.thread: self.thread.join()
+        def __str__(self): return self.target.__name__
 
-      def __init__(self, target):
-          self.target = target
-          self._stdout = Pipe.Output.Buffer()
-      name = property(lambda self : self.target.__name__)
-      stdin = property(lambda self : self)
-      stdout = property(lambda self : None)
-      def pipefrom(self, isFirst, isLast, stdin=None):
-          pass
-      def pipeinto(self, isFirst, isLast, stdout=None):
-          if stdout:
-              data = self._stdout.buffer
-              if data:
-                  stdout.write(data)
-              self._stdout = stdout
-      def wait(self):
-          pass
-      # Pretend to be an outputstream
-      def write(self, text):
-          data = self.target(text)
-          if data is not None:
-              self._stdout.write(data)
-      def close(self):
-          self._stdout.close()
+    class ReadOutput(Target):
+        def __init__(self, target):
+            self.target = target
+        def start(self, prev_process, next_process):
+            if prev_process.stdout:
+                for line in prev_process.stdout:
+                    self.target(line)
+        def get_stdin(self): return self
+        def write(self, x): self.target(x)
+        def close(self): pass
+        def __str__(self): return self.target.__name__
 
-  # Pipe
-  def __init__(self, steps):
-      self.steps = steps
-  name = property(lambda self : 'Pipe %i steps' % len(self.steps))
-  stdin = property(lambda self : self.steps[0].stdin if len(self.steps) > 0 else None)
-  stdout = property(lambda self : self.steps[-1].stdin if len(self.steps) > 0 else None)
-  def append(self, step):
-      self.steps.append(step)
-      return self
-  def start(self):
-      self.pipefrom(True, True, None)
-      return self # So can do .start().wait()
-  def pipefrom(self, isFirst, isLast, stdin=None):
-      self._iFirst = 0 if isFirst else -1
-      self._iLast = len(self.steps)-1 if isLast else -1
-      self._stdin = stdin
-      for i in range(0, len(self.steps)):
-          self.step_pipefrom(i)
-          if i > 0:
-              self.step_pipeinto(i-1)
-      if isLast:
-          self.pipeinto(isFirst, isLast, None)
-  def pipeinto(self, isFirst, isLast, stdout=None):
-      self._stdout = stdout
-      if len(self.steps) > 0:
-          self.step_pipeinto(len(self.steps)-1)
-  def step_pipefrom(self, i):
-      stdin = self._stdin if i <= 0 else self.steps[i-1].stdout
-      self.steps[i].pipefrom(i == self._iFirst, i == self._iLast, stdin)
-  def step_pipeinto(self, i):
-      stdout = self._stdout if i >= len(self.steps)-1 else self.steps[i+1].stdin
-      self.steps[i].pipeinto(i == self._iFirst, i == self._iLast, stdout)
-  def wait(self):
-      for step in self.steps:
-          step.wait()
+    def __init__(self, command=None, target=None, parent=None):
+        if command:
+            self.target = Pipeline.Popen(command)
+        elif target:
+            self.target = target
+        self.parent = parent
+    def get_root(self):
+        root = self
+        while root.parent: root = root.parent
+        return root
+    def get_processes(self):
+        process = self
+        while process:
+            yield process
+            process = process.parent
+    root = property(lambda self : self.get_root())
+    processes = property(lambda self : self.get_processes())
+    stdin = property(lambda self : self.target.stdin)
+    stdout = property(lambda self : self.target.stdout)
+    def before_start_next(self, next_process=None):
+        if self.target.should_start_before_next(next_process): self.start(next_process)
+    def after_start_next(self, next_process=None):
+        if self.target.should_start_after_next(next_process): self.start(next_process)
+    def start(self, next_process=None):
+        if self.parent: self.parent.before_start_next(self)
+        self.target.start(self.parent, next_process)
+        if self.parent: self.parent.after_start_next(self)
+        return self
+    def wait(self):
+        if self.parent: self.parent.wait()
+        self.target.wait()
+    def pipe_into(self, command):
+        return Pipeline(target=Pipeline.Popen(command), parent=self)
+    def pipe_into_pipeline(self, pipeline):
+        pipeline.root.parent = self
+        return pipeline
+    def filter_output(self, target):
+        return Pipeline(target=Pipeline.FilterOutput(target), parent=self)
+    def read_output(self, target):
+        return Pipeline(target=Pipeline.ReadOutput(target), parent=self)
+    def __str__(self): return str(self.target)
 
 class StatusNoFiles(object):
     def __init__(self, fat, all):
@@ -256,7 +235,7 @@ class StatusNoFiles(object):
         self.all = all
         self.obj2fat = dict()
         self.obj2file = None
-    def filter(self, obj, fname):
+    def populate_obj2file(self, obj, fname):
         if fname:
             if not self.obj2file:
                 self.obj2file = dict()
@@ -278,21 +257,16 @@ class StatusNoFiles(object):
             else:
                 # Lookup filenames
                 found = set()
-                def print_matches(input):
-                    while True:
-                        line = input.readline()
-                        if not line: # EOF
-                            break
-                        splits = line.split(None, 1)
-                        if len(splits) == 2 and splits[0] in self.obj2fat:
-                            fat = self.obj2fat[splits[0]]
-                            if fat in fathashes:
-                                self.print_fat_with_filename(fat, indent, splits[0], splits[1].rstrip())
-                                found.add(fat)
-                Pipe([
-                    Pipe.Process('git rev-list --objects --all'),
-                    Pipe.Handler(print_matches)
-                ]).start().wait()
+                def print_matches(line):
+                    splits = line.split(None, 1)
+                    if len(splits) == 2 and splits[0] in self.obj2fat:
+                        fat = self.obj2fat[splits[0]]
+                        if fat in fathashes:
+                            self.print_fat_with_filename(fat, indent, splits[0], splits[1].rstrip())
+                            found.add(fat)
+                Pipeline('git rev-list --objects --all') \
+                    .read_output(print_matches) \
+                    .start().wait()
 
                 # Filename not found
                 for fat in fathashes:
@@ -305,20 +279,20 @@ class StatusNoFiles(object):
     def load_catalog(self):
         self.catalog = set()
         self.catalog = self.fat.catalog_objects()
-    def handle_referenced(self, line):
+    def did_get_referenced(self, line):
         fat, obj = line.split()
         self.obj2fat[obj] = fat
         if self.all:
             filename = self.obj2file[obj] if obj in self.obj2file else None
             self.print_fat_with_filename(fat, '', obj, filename)
     def run(self):
-        filter = self.filter if self.all else None
-        pipe = self.fat.pipe_referenced_objects(all=self.all, filter=filter).append(Pipe.Output(self.handle_referenced))
+        populate_obj2file = self.populate_obj2file if self.all else None
+        load_obj2fat = self.fat.referenced_objects_pipeline(all=self.all, filter=populate_obj2file) \
+            .read_output(self.did_get_referenced).start()
         load_catalog = threading.Thread(target=self.load_catalog)
         load_catalog.start()
-        pipe.start()
         load_catalog.join()
-        pipe.wait()
+        load_obj2fat.wait()
         referenced = set(self.obj2fat.values())
         orphans = referenced - self.catalog
         garbage = self.catalog - referenced
@@ -333,41 +307,45 @@ class StatusWithFiles(object):
     def __init__(self, fat, files):
         self.fat = fat
         self.paths = set(files)
+        self.referenced_objects_only = False
     def cut_sha1hash(self, input, output):
-        # mode obj stage filename \x00 filter \x00 fat
-        i = 0
+        # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
+        part_index = 0
         file = obj = None
         for line in input:
             for part in line.split('\x00'):
                 if len(part) == 0:
                     break; # EOF
-                if i == 0:
+                if part_index == 0:
                     mode, obj, stage, file = part.split(None, 3)
                     if mode.startswith('100'):
                         file = file.rstrip()
                     else:
                         file = obj = None
-                elif i == 2:
-                    if file and (part == 'fat' or not self.fat_files_only):
-                        existing = self.obj2file[obj] if obj in self.obj2file else None
-                        if existing:
-                            if isinstance(existing, list):
-                                existing.append(file)
+                elif part_index == 1:
+                    if file and part != 'filter':
+                        file = obj = None
+                elif part_index == 2:
+                    if file and (part == 'fat' or not self.referenced_objects_only):
+                        file_or_files = self.obj2file_or_files[obj] if obj in self.obj2file_or_files else None
+                        if file_or_files:
+                            if isinstance(file_or_files, list):
+                                file_or_files.append(file)
                             else:
-                                self.obj2file[obj] = [existing, file]
+                                self.obj2file_or_files[obj] = [file_or_files, file]
                         else:
-                            self.obj2file[obj] = file
+                            self.obj2file_or_files[obj] = file
                             output.write(obj + '\n')
-                i = (i + 1) % 3
-            output.close()
-    def handle_referenced(self, line):
+                part_index = (part_index + 1) % 3
+        output.close()
+    def did_get_referenced(self, line):
         fat, obj = line.split()
-        files = self.obj2file[obj]
-        if isinstance(files, list):
-            for file in files:
+        file_or_files = self.obj2file_or_files[obj]
+        if isinstance(file_or_files, list):
+            for file in file_or_files:
                 self.did_get_referenced_file(fat, file)
         else:
-            self.did_get_referenced_file(fat, files)
+            self.did_get_referenced_file(fat, file_or_files)
     def did_get_referenced_file(self, fat, file):
         fatfile = os.path.join(self.fat.objdir, fat)
         status = 'fat' if os.path.exists(fatfile) else 'orphan'
@@ -385,23 +363,20 @@ class StatusWithFiles(object):
             self.run_with_files(set(dir), is_dir=True)
     def run_with_files(self, files, is_dir=False): #dir=None):
         self.fat_files = set()
-        self.obj2file = dict()
-        self.fat_files_only = is_dir
-        pipe = self.fat.pipe_filter_referenced_objects(Pipe([
-            Pipe.Process(['git','ls-files','-s','-z'] + list(files)),
-            Pipe.Process('git check-attr --stdin -z filter'),
-            Pipe.Handler(self.cut_sha1hash)
-        ])).append(Pipe.Output(self.handle_referenced))
-        pipe.start().wait()
+        self.obj2file_or_files = dict()
+        self.referenced_objects_only = is_dir
+        Pipeline(['git','ls-files','-s','-z'] + list(files)) \
+            .pipe_into('git check-attr --stdin -z filter') \
+            .filter_output(self.cut_sha1hash) \
+            .pipe_into_pipeline(self.fat.referenced_objects_from_hashes_pipeline()) \
+            .read_output(self.did_get_referenced) \
+            .start().wait()
 
         # Not fat
-        foundFiles = set([foundFiles for foundFileOrFiles in self.obj2file.values() for foundFiles in (foundFileOrFiles if isinstance(foundFileOrFiles, list) else [foundFileOrFiles])])
-        file2obj = dict([
-            files2objs for fileOrFiles2obj in ((self.obj2file[obj],obj) for obj in self.obj2file.keys()) for files2objs in (((file,fileOrFiles2obj[1]) for file in fileOrFiles2obj[0]) if isinstance(fileOrFiles2obj[0], list) else [fileOrFiles2obj])
-        ])
-        unmatched = (foundFiles if is_dir else files) - self.fat_files
+        file2obj = self.file2obj_from_obj2file_or_files()
+        unmatched = (set(file2obj.keys()) if is_dir else files) - self.fat_files
         for file in unmatched:
-          if file not in foundFiles:
+          if file not in file2obj:
               self.print_error('not a git object', file)
           else:
               filehash = self.fat.file_hash(file)
@@ -409,6 +384,10 @@ class StatusWithFiles(object):
                   self.print_fat('garbage', filehash, file)
               else:
                   self.print_fat('unmanaged', file2obj[file], file)
+    def file2obj_from_obj2file_or_files(self):
+        return dict([
+            file2obj for file_or_files2obj in ((self.obj2file_or_files[obj],obj) for obj in self.obj2file_or_files.keys()) for file2obj in (((file,file_or_files2obj[1]) for file in file_or_files2obj[0]) if isinstance(file_or_files2obj[0], list) else [file_or_files2obj])
+        ])
     def print_error(self, msg, fname):
         self.print_fat('error', (' ' + msg + ' ').center(40, '-'), fname)
     def print_fat(self, status, hash, fname):
@@ -596,12 +575,11 @@ class GitFat(object):
         return set(os.listdir(self.objdir))
     def referenced_objects(self, rev=None, all=False, filter=None):
         referenced = set()
-        add_to_referenced = Pipe.Output(lambda line : referenced.add(line.split()[0]))
-        pipe = self.pipe_referenced_objects(rev, all, filter).append(add_to_referenced)
-        pipe.start().wait()
+        self.referenced_objects_pipeline(rev, all, filter) \
+            .read_output(lambda line : referenced.add(line.split(None, 1)[0])) \
+            .start().wait()
         return referenced
-
-    def pipe_referenced_objects(self, rev=None, all=False, filter=None):
+    def referenced_objects_pipeline(self, rev=None, all=False, filter=None):
         if all:
             rev = '--all'
         elif rev is None:
@@ -611,20 +589,17 @@ class GitFat(object):
             for line in input:
                 parts = line.split(None, 1)
                 objhash = parts[0]
-                fname = parts[1].rstrip() if len(parts) > 1 else None
+                fname = parts[1].rstrip() if len(parts) > 1 and filter else None
                 if objhash:
                     if not filter or filter(objhash, fname):
                         output.write(objhash + '\n')
             output.close()
 
-        return self.pipe_filter_referenced_objects(Pipe([
-            # Revision list gives us object names to inspect with cat-file
-            Pipe.Process(['git','rev-list','--objects',rev]),
-            # Extract hash
-            Pipe.Handler(cut_sha1hash)
-        ]))
-
-    def pipe_filter_referenced_objects(self, pipe_objects):
+        # Revision list gives us objects to inspect with cat-file
+        return Pipeline(['git','rev-list','--objects',rev]) \
+            .filter_output(cut_sha1hash) \
+            .pipe_into_pipeline(self.referenced_objects_from_hashes_pipeline())
+    def referenced_objects_from_hashes_pipeline(self):
         def filter_gitfat_candidates(input, output):
             for line in input:
                 objhash, objtype, size = line.split()
@@ -662,21 +637,16 @@ class GitFat(object):
                     if not data:
                         break  # EOF
                     bytes_read += len(data)
-            if output:
-                output.close()
+            output.close()
 
-        return Pipe([
-            # Provides object hashes to inspect
-            pipe_objects,
-            # Provides info for git-fat candidates in bulk
-            Pipe.Process('git cat-file --batch-check'),
-            # Analyse info to identify git-fat candidates
-            Pipe.Handler(filter_gitfat_candidates),
-            # Provides full contents of identified git-fat candidates in bulk
-            Pipe.Process('git cat-file --batch'),
-            # Extract fathash from contents
-            Pipe.Handler(extract_fathashes_from_gitfat_refs)
-        ])
+        # 1. Get info for git-fat candidates in bulk
+        # 2. Analyse info to identify git-fat candidates
+        # 3. Get full contents of identified git-fat candidates in bulk
+        # 4. Extract fathash from contents
+        return Pipeline('git cat-file --batch-check') \
+            .filter_output(filter_gitfat_candidates) \
+            .pipe_into('git cat-file --batch') \
+            .filter_output(extract_fathashes_from_gitfat_refs)
 
     def orphan_files(self, patterns=[]):
         'generator for all orphan placeholders in the working tree'
