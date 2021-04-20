@@ -123,29 +123,81 @@ def gitconfig_set(name, value, file=None):
     args += [name, value]
     p = subprocess.check_call(args)
 
-class Pipeline(object):
+class Async(object):
+    def should_start_before_next(self, next_async): return True
+    def should_start_after_next(self, next_async): return False
+    def start(self, prev_async, next_async): pass
+    def wait(self): pass
+    def get_stdin(self): return None
+    def get_stdout(self): return None
+    stdin = property(lambda self : self.get_stdin())
+    stdout = property(lambda self : self.get_stdout())
+
+class Asyncs(Async):
+    def __init__(self, async, parent=None):
+        self.async = async
+        self.parent = parent
+    def before_start_next(self, next_async=None):
+        if self.async.should_start_before_next(next_async): self.start(None, next_async)
+    def after_start_next(self, next_async=None):
+        if self.async.should_start_after_next(next_async): self.start(None, next_async)
+    def start(self, prev_async=None, next_async=None):
+        if self.parent: self.parent.before_start_next(self.async)
+        self.async.start(self.parent_async, next_async)
+        if self.parent: self.parent.after_start_next(self.async)
+        return self
+    def wait(self):
+        if self.parent: self.parent.wait()
+        self.async.wait()
+    def get_root(self):
+        root = self
+        while root.parent: root = root.parent
+        return root
+    def get_asyncs(self):
+        asyncs = self
+        while asyncs:
+            yield asyncs.async
+            asyncs = asyncs.parent
+    root = property(lambda self : self.get_root())
+    asyncs = property(lambda self : self.get_asyncs())
+    parent_async = property(lambda self : self.parent.async if self.parent else None)
+    def get_stdin(self): return self.root.async.stdin
+    def get_stdout(self): return self.async.stdout
+    def __str__(self): return ' '.join(reversed([str(async) for async in self.asyncs]))
+
+class Parallel(Asyncs, Async):
+    class Thread(Async):
+        def __init__(self, target):
+            self.target = target
+            self.thread = None
+        def start(self, prev_async, next_async):
+            self.thread = threading.Thread(target=self.target)
+            self.thread.start()
+        def wait(self):
+            if self.thread: self.thread.join()
+        def __str__(self): return self.target.__name__
+    def __init__(self, *args, **kwargs):
+        parent = kwargs['parent'] if 'parent' in kwargs else None
+        for arg in args[:-1]:
+            parent = Parallel(arg, parent=parent)
+        arg = args[-1]
+        if not isinstance(arg, Async):
+            arg = Parallel.Thread(arg)
+        super(Parallel, self).__init__(arg, parent=parent)
+
+class Pipeline(Asyncs):
     class Devnull(object):
         def write(self, x): pass
         def close(self): pass
 
-    class Target(object):
-        def should_start_before_next(self, next_process): return True
-        def should_start_after_next(self, next_process): return False
-        def start(self): pass
-        def wait(self): pass
-        def get_stdin(self): return None
-        def get_stdout(self): return None
-        stdin = property(lambda self : self.get_stdin())
-        stdout = property(lambda self : self.get_stdout())
-
-    class Popen(Target):
+    class Popen(Async):
         def __init__(self, command):
             self.command = command.split() if isinstance(command, str) else command
             self.process = None
-        def start(self, prev_process, next_process):
-            if prev_process:
-                if prev_process.stdout:
-                    stdin = prev_process.stdout
+        def start(self, prev_async, next_async):
+            if prev_async:
+                if prev_async.stdout:
+                    stdin = prev_async.stdout
                 else:
                     stdin = subprocess.PIPE
             else:
@@ -157,16 +209,16 @@ class Pipeline(object):
         def get_stdout(self): return self.process.stdout if self.process else None
         def __str__(self): return ' '.join(self.command)
 
-    class FilterOutput(Target):
+    class FilterOutput(Async):
         def __init__(self, target):
             self.target = target
             self.thread = None
-        def should_start_before_next(self, next_process): return not next_process
-        def should_start_after_next(self, next_process): return next_process
-        def start(self, prev_process, next_process):
-            stdin = prev_process.stdout
-            if next_process:
-                stdout = next_process.stdin
+        def should_start_before_next(self, next_async): return not next_async
+        def should_start_after_next(self, next_async): return next_async
+        def start(self, prev_async, next_async):
+            stdin = prev_async.stdout
+            if next_async:
+                stdout = next_async.stdin
             else:
                 stdout = Pipeline.Devnull()
             self.thread = threading.Thread(target=self.target, args=(stdin, stdout))
@@ -175,59 +227,31 @@ class Pipeline(object):
             if self.thread: self.thread.join()
         def __str__(self): return self.target.__name__
 
-    class ReadOutput(Target):
+    class ReadOutput(Async):
         def __init__(self, target):
             self.target = target
-        def start(self, prev_process, next_process):
-            if prev_process.stdout:
-                for line in prev_process.stdout:
+        def start(self, prev_async, next_async):
+            if prev_async.stdout:
+                for line in prev_async.stdout:
                     self.target(line)
         def get_stdin(self): return self
         def write(self, x): self.target(x)
         def close(self): pass
         def __str__(self): return self.target.__name__
 
-    def __init__(self, command=None, target=None, parent=None):
+    def __init__(self, command=None, async=None, parent=None):
         if command:
-            self.target = Pipeline.Popen(command)
-        elif target:
-            self.target = target
-        self.parent = parent
-    def get_root(self):
-        root = self
-        while root.parent: root = root.parent
-        return root
-    def get_processes(self):
-        process = self
-        while process:
-            yield process
-            process = process.parent
-    root = property(lambda self : self.get_root())
-    processes = property(lambda self : self.get_processes())
-    stdin = property(lambda self : self.target.stdin)
-    stdout = property(lambda self : self.target.stdout)
-    def before_start_next(self, next_process=None):
-        if self.target.should_start_before_next(next_process): self.start(next_process)
-    def after_start_next(self, next_process=None):
-        if self.target.should_start_after_next(next_process): self.start(next_process)
-    def start(self, next_process=None):
-        if self.parent: self.parent.before_start_next(self)
-        self.target.start(self.parent, next_process)
-        if self.parent: self.parent.after_start_next(self)
-        return self
-    def wait(self):
-        if self.parent: self.parent.wait()
-        self.target.wait()
+            async = Pipeline.Popen(command)
+        super(Pipeline, self).__init__(async, parent=parent)
     def pipe_into(self, command):
-        return Pipeline(target=Pipeline.Popen(command), parent=self)
+        return Pipeline(async=Pipeline.Popen(command), parent=self)
     def pipe_into_pipeline(self, pipeline):
         pipeline.root.parent = self
         return pipeline
     def filter_output(self, target):
-        return Pipeline(target=Pipeline.FilterOutput(target), parent=self)
+        return Pipeline(async=Pipeline.FilterOutput(target), parent=self)
     def read_output(self, target):
-        return Pipeline(target=Pipeline.ReadOutput(target), parent=self)
-    def __str__(self): return str(self.target)
+        return Pipeline(async=Pipeline.ReadOutput(target), parent=self)
 
 class StatusNoFiles(object):
     def __init__(self, fat, all):
@@ -288,11 +312,8 @@ class StatusNoFiles(object):
     def run(self):
         populate_obj2file = self.populate_obj2file if self.all else None
         load_obj2fat = self.fat.referenced_objects_pipeline(all=self.all, filter=populate_obj2file) \
-            .read_output(self.did_get_referenced).start()
-        load_catalog = threading.Thread(target=self.load_catalog)
-        load_catalog.start()
-        load_catalog.join()
-        load_obj2fat.wait()
+            .read_output(self.did_get_referenced)
+        Parallel(load_obj2fat, self.load_catalog).start().wait()
         referenced = set(self.obj2fat.values())
         orphans = referenced - self.catalog
         garbage = self.catalog - referenced
