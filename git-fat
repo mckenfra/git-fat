@@ -124,73 +124,41 @@ def gitconfig_set(name, value, file=None):
     p = subprocess.check_call(args)
 
 class Async(object):
-    def should_start_before_next(self, next_async): return True
-    def should_start_after_next(self, next_async): return False
-    def start(self, prev_async, next_async): pass
-    def wait(self): pass
-    def get_stdin(self): return None
-    def get_stdout(self): return None
-    stdin = property(lambda self : self.get_stdin())
-    stdout = property(lambda self : self.get_stdout())
-
-class Asyncs(Async):
-    def __init__(self, async, parent=None):
-        self.async = async
+    def __init__(self, plugin, parent=None):
+        self.plugin = plugin
         self.parent = parent
-    def before_start_next(self, next_async=None):
-        if self.async.should_start_before_next(next_async): self.start(None, next_async)
-    def after_start_next(self, next_async=None):
-        if self.async.should_start_after_next(next_async): self.start(None, next_async)
-    def start(self, prev_async=None, next_async=None):
-        if self.parent: self.parent.before_start_next(self.async)
-        self.async.start(self.parent_async, next_async)
-        if self.parent: self.parent.after_start_next(self.async)
+    def will_start_next(self, next_async):
+        if self.plugin.should_start_before_next(self): self.start(next_async)
+    def did_start_next(self, next_async):
+        if self.plugin.should_start_after_next(self): self.start(next_async)
+    def start(self, next_async=None):
+        if self.parent: self.parent.will_start_next(self)
+        self.plugin.start(self.parent, next_async)
+        if self.parent: self.parent.did_start_next(self)
         return self
     def wait(self):
-        if self.parent: self.parent.wait()
-        self.async.wait()
+        for async in self.asyncs:
+            async.plugin.wait()
     def get_root(self):
-        root = self
-        while root.parent: root = root.parent
+        for async in self.asyncs:
+            root = async
         return root
     def get_asyncs(self):
-        asyncs = self
-        while asyncs:
-            yield asyncs.async
-            asyncs = asyncs.parent
+        async = self
+        while async:
+            yield async
+            async = async.parent
     root = property(lambda self : self.get_root())
     asyncs = property(lambda self : self.get_asyncs())
-    parent_async = property(lambda self : self.parent.async if self.parent else None)
-    def get_stdin(self): return self.root.async.stdin
-    def get_stdout(self): return self.async.stdout
-    def __str__(self): return ' '.join(reversed([str(async) for async in self.asyncs]))
+    stdin = property(lambda self : self.plugin.stdin)
+    stdout = property(lambda self : self.plugin.stdout)
+    def __str__(self): return ' '.join(reversed([str(async.plugin) for async in self.asyncs]))
+    def __iter__(self): return self.plugin.iter_with_prev(self.parent)
+    def read(*args): return self.plugin.read_with_prev(self.parent, *args)
+    def readline(*args): return self.plugin.read_with_prev(self.parent, *args)
 
-class Parallel(Asyncs, Async):
-    class Thread(Async):
-        def __init__(self, target):
-            self.target = target
-            self.thread = None
-        def start(self, prev_async, next_async):
-            self.thread = threading.Thread(target=self.target)
-            self.thread.start()
-        def wait(self):
-            if self.thread: self.thread.join()
-        def __str__(self): return self.target.__name__
-    def __init__(self, *args, **kwargs):
-        parent = kwargs['parent'] if 'parent' in kwargs else None
-        for arg in args[:-1]:
-            parent = Parallel(arg, parent=parent)
-        arg = args[-1]
-        if not isinstance(arg, Async):
-            arg = Parallel.Thread(arg)
-        super(Parallel, self).__init__(arg, parent=parent)
-
-class Pipeline(Asyncs):
-    class Devnull(object):
-        def write(self, x): pass
-        def close(self): pass
-
-    class Popen(Async):
+class Pipeline(Async):
+    class Popen(object):
         def __init__(self, command):
             self.command = command.split() if isinstance(command, str) else command
             self.process = None
@@ -205,53 +173,64 @@ class Pipeline(Asyncs):
             self.process = subprocess.Popen(self.command, stdin=stdin, stdout=subprocess.PIPE)
         def wait(self):
             if self.process: self.process.wait()
-        def get_stdin(self): return self.process.stdin if self.process else None
-        def get_stdout(self): return self.process.stdout if self.process else None
+        def iter_with_prev(self, prev_async):
+            if self.process:
+                for line in self.process.stdout:
+                    yield line
+        def read_with_prev(self, prev_async, *args):
+            if self.process:
+                return self.process.read(*args)
+        def readline_with_prev(self, prev_async, *args):
+            if self.process:
+                return self.process.readline(*args)
+        def should_start_before_next(self, next_async): return True
+        def should_start_after_next(self, next_async): return False
+        stdin = property(lambda self : (self.process.stdin if self.process else None))
+        stdout = property(lambda self : (self.process.stdout if self.process else None))
         def __str__(self): return ' '.join(self.command)
 
-    class FilterOutput(Async):
+    class FilterOutput(object):
         def __init__(self, target):
             self.target = target
             self.thread = None
-        def should_start_before_next(self, next_async): return not next_async
-        def should_start_after_next(self, next_async): return next_async
+            self.reading = None
         def start(self, prev_async, next_async):
-            stdin = prev_async.stdout
             if next_async:
+                stdin = prev_async.stdout
                 stdout = next_async.stdin
-            else:
-                stdout = Pipeline.Devnull()
-            self.thread = threading.Thread(target=self.target, args=(stdin, stdout))
-            self.thread.start()
+                self.thread = threading.Thread(target=self.pipe_into, args=(stdin, stdout))
+                self.thread.start()
+        def pipe_into(self, stdin, stdout):
+            for output in self.target(stdin):
+                stdout.write(output)
+            stdout.close()
         def wait(self):
             if self.thread: self.thread.join()
+        def iter_with_prev(self, prev_async):
+            return self.target(prev_async.stdout)
+        def read_with_prev(self, prev_async, *args):
+            return self.readline_with_prev(prev_async, *args)
+        def readline_with_prev(self, prev_async, *args):
+            if not self.reading:
+                self.reading = self.target(prev_async.stdout)
+            return self.reading.__next__()
+        def should_start_before_next(self, next_async): return False
+        def should_start_after_next(self, next_async): return next_async
+        stdin = property(lambda self : None)
+        stdout = property(lambda self : None)
         def __str__(self): return self.target.__name__
 
-    class ReadOutput(Async):
-        def __init__(self, target):
-            self.target = target
-        def start(self, prev_async, next_async):
-            if prev_async.stdout:
-                for line in prev_async.stdout:
-                    self.target(line)
-        def get_stdin(self): return self
-        def write(self, x): self.target(x)
-        def close(self): pass
-        def __str__(self): return self.target.__name__
-
-    def __init__(self, command=None, async=None, parent=None):
+    def __init__(self, command=None, plugin=None, parent=None):
         if command:
-            async = Pipeline.Popen(command)
-        super(Pipeline, self).__init__(async, parent=parent)
+            plugin = Pipeline.Popen(command)
+        super(Pipeline, self).__init__(plugin, parent=parent)
     def pipe_into(self, command):
-        return Pipeline(async=Pipeline.Popen(command), parent=self)
+        return Pipeline(plugin=Pipeline.Popen(command), parent=self)
     def pipe_into_pipeline(self, pipeline):
         pipeline.root.parent = self
         return pipeline
     def filter_output(self, target):
-        return Pipeline(async=Pipeline.FilterOutput(target), parent=self)
-    def read_output(self, target):
-        return Pipeline(async=Pipeline.ReadOutput(target), parent=self)
+        return Pipeline(plugin=Pipeline.FilterOutput(target), parent=self)
 
 class StatusNoFiles(object):
     def __init__(self, fat, all):
@@ -280,17 +259,16 @@ class StatusNoFiles(object):
                     self.print_fat_with_filename(fat, indent, obj, filename)
             else:
                 # Lookup filenames
+                rev_list = Pipeline('git rev-list --objects --all').start()
                 found = set()
-                def print_matches(line):
+                for line in rev_list:
                     splits = line.split(None, 1)
                     if len(splits) == 2 and splits[0] in self.obj2fat:
                         fat = self.obj2fat[splits[0]]
                         if fat in fathashes:
                             self.print_fat_with_filename(fat, indent, splits[0], splits[1].rstrip())
                             found.add(fat)
-                Pipeline('git rev-list --objects --all') \
-                    .read_output(print_matches) \
-                    .start().wait()
+                rev_list.wait()
 
                 # Filename not found
                 for fat in fathashes:
@@ -310,10 +288,14 @@ class StatusNoFiles(object):
             filename = self.obj2file[obj] if obj in self.obj2file else None
             self.print_fat_with_filename(fat, '', obj, filename)
     def run(self):
-        populate_obj2file = self.populate_obj2file if self.all else None
-        load_obj2fat = self.fat.referenced_objects_pipeline(all=self.all, filter=populate_obj2file) \
-            .read_output(self.did_get_referenced)
-        Parallel(load_obj2fat, self.load_catalog).start().wait()
+        load_catalog = threading.Thread(target=self.load_catalog)
+        load_catalog.start()
+        on_filename = self.populate_obj2file if self.all else None
+        load_obj2fat = self.fat.referenced_objects_pipeline(all=self.all, on_filename=on_filename).start()
+        for referenced in load_obj2fat:
+            self.did_get_referenced(referenced)
+        load_catalog.join()
+        load_obj2fat.wait()
         referenced = set(self.obj2fat.values())
         orphans = referenced - self.catalog
         garbage = self.catalog - referenced
@@ -329,7 +311,7 @@ class StatusWithFiles(object):
         self.fat = fat
         self.paths = set(files)
         self.referenced_objects_only = False
-    def cut_sha1hash(self, input, output):
+    def cut_sha1hash(self, input):
         # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
         part_index = 0
         file = obj = None
@@ -356,9 +338,8 @@ class StatusWithFiles(object):
                                 self.obj2file_or_files[obj] = [file_or_files, file]
                         else:
                             self.obj2file_or_files[obj] = file
-                            output.write(obj + '\n')
+                            yield obj + '\n'
                 part_index = (part_index + 1) % 3
-        output.close()
     def did_get_referenced(self, line):
         fat, obj = line.split()
         file_or_files = self.obj2file_or_files[obj]
@@ -386,12 +367,14 @@ class StatusWithFiles(object):
         self.fat_files = set()
         self.obj2file_or_files = dict()
         self.referenced_objects_only = is_dir
-        Pipeline(['git','ls-files','-s','-z'] + list(files)) \
+        get_referenced = Pipeline(['git','ls-files','-s','-z'] + list(files)) \
             .pipe_into('git check-attr --stdin -z filter') \
             .filter_output(self.cut_sha1hash) \
             .pipe_into_pipeline(self.fat.referenced_objects_from_hashes_pipeline()) \
-            .read_output(self.did_get_referenced) \
-            .start().wait()
+            .start()
+        for referenced in get_referenced:
+            self.did_get_referenced(referenced)
+        get_referenced.wait()
 
         # Not fat
         file2obj = self.file2obj_from_obj2file_or_files()
@@ -416,8 +399,8 @@ class StatusWithFiles(object):
 
 class GitFat(object):
     DecodeError = RuntimeError
-    def __init__(self):
-        self.verbose = verbose_stderr if os.environ.get('GIT_FAT_VERBOSE') else verbose_ignore
+    def __init__(self, verbose=False):
+        self.verbose = verbose_stderr if os.environ.get('GIT_FAT_VERBOSE') or verbose else verbose_ignore
         try:
             self.gitroot = subprocess.check_output('git rev-parse --show-toplevel'.split()).strip()
         except subprocess.CalledProcessError:
@@ -594,40 +577,37 @@ class GitFat(object):
             cat_iter(result, sys.stdout)
     def catalog_objects(self):
         return set(os.listdir(self.objdir))
-    def referenced_objects(self, rev=None, all=False, filter=None):
-        referenced = set()
-        self.referenced_objects_pipeline(rev, all, filter) \
-            .read_output(lambda line : referenced.add(line.split(None, 1)[0])) \
-            .start().wait()
+    def referenced_objects(self, rev=None, all=False):
+        get_referenced = self.referenced_objects_pipeline(rev, all).start()
+        referenced = set([line.split(None, 1)[0] for line in get_referenced])
+        get_referenced.wait()
         return referenced
-    def referenced_objects_pipeline(self, rev=None, all=False, filter=None):
+    def referenced_objects_pipeline(self, rev=None, all=False, on_filename=None):
         if all:
             rev = '--all'
         elif rev is None:
             rev = self.revparse('HEAD')
 
-        def cut_sha1hash(input, output):
+        def cut_sha1hash(input):
             for line in input:
                 parts = line.split(None, 1)
                 objhash = parts[0]
-                fname = parts[1].rstrip() if len(parts) > 1 and filter else None
                 if objhash:
-                    if not filter or filter(objhash, fname):
-                        output.write(objhash + '\n')
-            output.close()
+                    if on_filename and len(parts) > 1:
+                        on_filename(objhash, parts[1].rstrip())
+                    yield objhash + '\n'
 
         # Revision list gives us objects to inspect with cat-file
         return Pipeline(['git','rev-list','--objects',rev]) \
             .filter_output(cut_sha1hash) \
             .pipe_into_pipeline(self.referenced_objects_from_hashes_pipeline())
     def referenced_objects_from_hashes_pipeline(self):
-        def filter_gitfat_candidates(input, output):
+        def filter_gitfat_candidates(input):
             for line in input:
                 objhash, objtype, size = line.split()
                 if objtype == 'blob' and int(size) in self.magiclens:
-                    output.write(objhash + '\n')
-            output.close()
-        def extract_fathashes_from_gitfat_refs(input, output):
+                    yield objhash + '\n'
+        def extract_fathashes_from_gitfat_refs(input):
             # Process metadata + content format provided by `cat-file --batch`
             while True:
                 metadata_line = input.readline()
@@ -646,8 +626,7 @@ class GitFat(object):
                     bytes_read += len(data)
                 try:
                     fathash = self.decode(content)[0]
-                    if output:
-                        output.write('' + fathash + ' ' + objhash + '\n')
+                    yield '' + fathash + ' ' + objhash + '\n'
                 except GitFat.DecodeError:
                     self.verbose('decode error: %s' % objhash)
                     pass
@@ -658,7 +637,6 @@ class GitFat(object):
                     if not data:
                         break  # EOF
                     bytes_read += len(data)
-            output.close()
 
         # 1. Get info for git-fat candidates in bulk
         # 2. Analyse info to identify git-fat candidates
@@ -834,9 +812,9 @@ class GitFat(object):
         time0 = time.time()
         # Find all names assumed by large blobs (those in blobsizes)
         pathsizes = collections.defaultdict(lambda:set())
-        revlist = subprocess.Popen(['git', 'rev-list', '--all'], stdout=subprocess.PIPE, bufsize=-1)
-        difftree = subprocess.Popen(['git', 'diff-tree', '--root', '--no-renames', '--no-commit-id', '--diff-filter=AMCR', '-r', '--stdin', '-z'],
-                                    stdin=revlist.stdout, stdout=subprocess.PIPE)
+        difftree = Pipeline(['git', 'rev-list', '--all']) \
+            .pipe_into(['git', 'diff-tree', '--root', '--no-renames', '--no-commit-id', '--diff-filter=AMCR', '-r', '--stdin', '-z']) \
+            .start()
         for newblob, modflag, path in difftreez_reader(difftree.stdout):
             bsize = blobsizes.get(newblob)
             if bsize:                     # We care about this blob
@@ -846,7 +824,6 @@ class GitFat(object):
         maxlen = max(map(len,pathsizes)) if pathsizes else 0
         for path, sizes in sorted(pathsizes.items(), key=lambda ps: max(ps[1]), reverse=True):
             print('%-*s filter=fat -text # %10d %d' % (maxlen, path,max(sizes),len(sizes)))
-        revlist.wait()
         difftree.wait()
     def cmd_index_filter(self, args):
         manage_gitattributes = '--manage-gitattributes' in args
@@ -897,21 +874,19 @@ class GitFat(object):
         lsfiles.wait()
         updateindex.wait()
 
-def main(*args):
-    fat = GitFat()
-    cmd = args[0] if len(args) > 0 else ''
+def main(fat, cmd, args):
     if cmd == 'filter-clean':
-        fat.cmd_filter_clean(args[1] if len(args) > 1 else None)
+        fat.cmd_filter_clean(args[0] if args else None)
     elif cmd == 'filter-smudge':
-        fat.cmd_filter_smudge(args[1] if len(args) > 1 else None)
+        fat.cmd_filter_smudge(args[0] if args else None)
     elif cmd == 'init':
         fat.cmd_init()
     elif cmd == 'status':
-        fat.cmd_status(args[1:])
+        fat.cmd_status(args)
     elif cmd == 'push':
-        fat.cmd_push(args[1:])
+        fat.cmd_push(args)
     elif cmd == 'pull':
-        fat.cmd_pull(args[1:])
+        fat.cmd_pull(args)
     elif cmd == 'gc':
         fat.cmd_gc()
     elif cmd == 'verify':
@@ -919,7 +894,7 @@ def main(*args):
     elif cmd == 'checkout':
         fat.cmd_checkout(args)
     elif cmd == 'find':
-        fat.cmd_find(args)
+        fat.cmd_find(*args)
     elif cmd == 'index-filter':
         fat.cmd_index_filter(args)
     else:
@@ -929,11 +904,12 @@ if __name__ == '__main__':
     cmd, verbose, args = (sys.argv[1], '--verbose' in sys.argv, [arg for arg in sys.argv[2:] if arg != '--verbose']) if len(sys.argv) > 1 else ('', False, [])
     if not verbose:
         verbose = os.environ.get('GIT_FAT_VERBOSE')
+    fat = GitFat(verbose=verbose)
     if verbose:
-        main(cmd, *args)
+        main(fat, cmd, args)
     else:
         try:
-            main(cmd, *args)
+            main(fat, cmd, args)
         except Exception, e:
             prefix = '[git-fat] ' if cmd == 'filter-clean' or cmd == 'filter-smudge' else ''
             print('%s%s' % (prefix, e), file=sys.stderr)
