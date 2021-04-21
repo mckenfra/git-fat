@@ -47,6 +47,35 @@ except ImportError:
 
 BLOCK_SIZE = 4096
 
+class Enum(object):
+    def __init__(self, name): self.name = name
+    def __str__(self): return self.name
+
+class FatState(Enum):
+    OK = Enum('ok')
+    ORPHAN = Enum('orph')
+    GARBAGE = Enum('crud')
+    NOTFAT = Enum('....')
+
+class FileState():
+    OK = Enum('ok')
+    STUB = Enum('stub')
+    DIFF = Enum('diff')
+    NOTFAT = Enum('....')
+
+class Style():
+    BOLD = '\33[1m'
+    BLACK = '\033[30m'
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    MAGENTA = '\033[35m'
+    CYAN = '\033[36m'
+    WHITE = '\033[37m'
+    UNDERLINE = '\033[4m'
+    RESET = '\033[0m'
+
 def verbose_stderr(*args, **kwargs):
     return print(*args, file=sys.stderr, **kwargs)
 def verbose_ignore(*args, **kwargs):
@@ -301,7 +330,7 @@ class StatusNoFiles(object):
         self.catalog = set()
         self.catalog = self.fat.catalog_objects()
     def did_get_referenced(self, line):
-        fat, obj = line.split(None, 1)
+        fat, obj, size = line.split(None, 2)
         self.obj2fat[obj] = fat
         if self.all:
             filename = self.obj2file[obj] if obj in self.obj2file else None
@@ -336,7 +365,7 @@ class StatusWithFiles(object):
         file = obj = None
         for line in input:
             for part in line.split('\x00'):
-                if len(part) == 0:
+                if not part:
                     break; # EOF
                 if part_index == 0:
                     mode, obj, stage, file = part.split(None, 3)
@@ -360,24 +389,32 @@ class StatusWithFiles(object):
                             yield obj + '\n'
                 part_index = (part_index + 1) % 3
     def did_get_referenced(self, line):
-        fat, obj = line.split()
+        fat, obj, size = line.split()
         file_or_files = self.obj2file_or_files[obj]
         if isinstance(file_or_files, list):
             for file in file_or_files:
-                self.did_get_referenced_file(fat, file)
+                self.did_get_referenced_file(fat, file, size)
         else:
-            self.did_get_referenced_file(fat, file_or_files)
-    def did_get_referenced_file(self, fat, file):
+            self.did_get_referenced_file(fat, file_or_files, size)
+    def did_get_referenced_file(self, fat, file, size):
         fatfile = os.path.join(self.fat.objdir, fat)
-        status = 'fat' if os.path.exists(fatfile) else 'orphan'
-        self.print_fat(status, fat, file)
+        digest, bytes, filesize = self.fat.decode_file(file)
+        fatstate = FatState.OK if os.path.exists(fatfile) else FatState.ORPHAN
+        if digest:
+            filestate = FileState.STUB
+        else:
+            if filesize != int(size):
+                filestate = FileState.DIFF
+            else:
+                filestate = FileState.OK
+        self.print_fat(fat, file, fatstate, filestate)
         self.fat_files.add(file)
     def run(self):
         dirs = set()
         files = set()
         for path in self.paths:
             dirs.add(path) if os.path.isdir(path) else files.add(path)
-        if len(files) > 0:
+        if files:
             self.run_with_files(files)
         files = None # Free memory
         for dir in dirs:
@@ -399,22 +436,30 @@ class StatusWithFiles(object):
         file2obj = self.file2obj_from_obj2file_or_files()
         unmatched = (set(file2obj.keys()) if is_dir else files) - self.fat_files
         for file in unmatched:
-          if file not in file2obj:
-              self.print_error('not a git object', file)
-          else:
+          if file in file2obj:
               filehash = self.fat.file_hash(file)
-              if os.path.exists(os.path.join(self.fat.objdir, filehash)):
-                  self.print_fat('garbage', filehash, file)
+              if not filehash or not os.path.exists(os.path.join(self.fat.objdir, filehash)):
+                  self.print_fat(filehash, file, FileState.NOTFAT, FileState.NOTFAT)
               else:
-                  self.print_fat('unmanaged', file2obj[file], file)
+                  self.print_fat(filehash, file, FatState.GARBAGE, FileState.NOTFAT)
+          else:
+              self.print_fat('.' * 40, file, FileState.NOTFAT, FileState.NOTFAT)
     def file2obj_from_obj2file_or_files(self):
         return dict([
             file2obj for file_or_files2obj in ((self.obj2file_or_files[obj],obj) for obj in self.obj2file_or_files.keys()) for file2obj in (((file,file_or_files2obj[1]) for file in file_or_files2obj[0]) if isinstance(file_or_files2obj[0], list) else [file_or_files2obj])
         ])
     def print_error(self, msg, fname):
         self.print_fat('error', (' ' + msg + ' ').center(40, '-'), fname)
-    def print_fat(self, status, hash, fname):
-        print('[' + status.center(11) + ']  ' + hash + '  "' + fname + '"')
+    def print_fat(self, hash, fname, fatstate, filestate):
+        if fatstate == FatState.ORPHAN:
+            if filestate == FileState.DIFF:
+                style = Style.RED + Style.BOLD
+            else:
+                style = Style.YELLOW
+            clearstyle = Style.RESET
+        else:
+            style = clearstyle = ''
+        print('%s[%s] [%s]  %s  "%s"%s' % (style, str(filestate).center(4), str(fatstate).center(4), hash, fname, clearstyle))
 
 class GitFat(object):
     DecodeError = RuntimeError
@@ -477,10 +522,13 @@ class GitFat(object):
             cmd += [remote + '/', self.objdir + '/']
         return cmd
     def file_hash(self, fname):
-        h = hashlib.new('sha1')
-        for block in readblocks(open(fname)):
-            h.update(block)
-        return h.hexdigest()
+        try:
+            h = hashlib.new('sha1')
+            for block in readblocks(open(fname)):
+                h.update(block)
+            return h.hexdigest()
+        except OSError:
+            return None
     def revparse(self, revname):
         return subprocess.check_output(['git', 'rev-parse', revname]).strip()
     def encode_v1(self, digest, bytes):
@@ -513,18 +561,19 @@ class GitFat(object):
         try:
             stat = os.lstat(fname)
         except OSError:
-            return False, None
-        if stat.st_size != self.magiclen:
-            return False, None
+            return False, None, 0
+        filesize = stat.st_size
+        if filesize != self.magiclen:
+            return False, None, filesize
         # read file
         try:
             digest, bytes = self.decode_stream(open(fname))
         except IOError:
-            return False, None
+            return False, None, filesize
         if isinstance(digest, str):
-            return digest, bytes
+            return digest, bytes, filesize
         else:
-            return None, bytes
+            return None, bytes, filesize
     def decode_clean(self, body):
         '''
         Attempt to decode version in working tree. The tree version could be changed to have a more
@@ -644,8 +693,8 @@ class GitFat(object):
                     content += data
                     bytes_read += len(data)
                 try:
-                    fathash = self.decode(content)[0]
-                    yield '' + fathash + ' ' + objhash + '\n'
+                    fathash, bytes = self.decode(content)
+                    yield '%s %s %s\n' % (fathash, objhash, bytes)
                 except GitFat.DecodeError:
                     self.verbose('decode error: %s' % objhash)
                     pass
@@ -679,7 +728,7 @@ class GitFat(object):
         self.setup()
         if '--all' in args:
             status = StatusNoFiles(fat=self, all=True)
-        elif len(args) > 0:
+        elif args:
             status = StatusWithFiles(fat=self, files=args)
         else:
             status = StatusNoFiles(fat=self, all=False)
