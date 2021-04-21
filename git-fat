@@ -144,20 +144,47 @@ class Pipeline(object):
                 for line in self.process.stdout:
                     yield line
         def read_with_prev(self, prev, *args):
-            if self.process: return self.process.read(*args)
+            if self.process: return self.process.stdout.read(*args)
         def readline_with_prev(self, prev, *args):
-            if self.process: return self.process.readline(*args)
+            if self.process: return self.process.stdout.readline(*args)
         def should_start_before_next(self, next): return True
         def should_start_after_next(self, next): return False
         stdin = property(lambda self : (self.process.stdin if self.process else None))
         stdout = property(lambda self : (self.process.stdout if self.process else None))
         def __str__(self): return ' '.join(self.command)
 
+    class IteratorReader(object):
+        def __init__(self, iterator):
+            self.iterator = iterator
+            self.remaining = ''
+        def read(self, *args): return self._read(False, *args)
+        def readline(self, *args): return self._read(True, *args)
+        def readall(self):
+            result = self.remaining + '\n'.join(self.iterator)
+            self.remaining = ''
+            return result
+        def _read(self, oneline, *args):
+            size = args[0] if args else -1
+            if size == 0: return ''
+            if size < 0: return self.readall()
+            while len(result) < size:
+                data = self.iterator.__next__()
+                if data:
+                  result += data + '\n'
+                  if oneline: break
+                else: break
+            if len(result) >= size:
+                self.remaining = result[size:]
+                return result[:size]
+            else:
+                self.remaining = ''
+                return result
+
     class FilterOutput(object):
         def __init__(self, target):
             self.target = target
             self.thread = None
-            self.reading = None
+            self.reader = None
         def start(self, prev, next):
             if next:
                 stdin = prev.stdout
@@ -171,12 +198,14 @@ class Pipeline(object):
         def wait(self):
             if self.thread: self.thread.join()
         def iter_with_prev(self, prev):
-            return self.target(prev.stdout)
+            for line in self.target(prev):
+                yield line.rstrip()
         def read_with_prev(self, prev, *args):
-            return self.readline_with_prev(prev, *args)
+            if not self.reader: self.reader = Pipeline.IteratorReader(self.target(prev))
+            return self.reader.read(*args)
         def readline_with_prev(self, prev, *args):
-            if not self.reading: self.reading = self.target(prev.stdout)
-            return self.reading.__next__()
+            if not self.reader: self.reader = Pipeline.IteratorReader(self.target(prev))
+            return self.reader.readline(*args)
         def should_start_before_next(self, next): return False
         def should_start_after_next(self, next): return next
         stdin = property(lambda self : None)
@@ -219,8 +248,8 @@ class Pipeline(object):
     stdout = property(lambda self : self.plugin.stdout)
     def __str__(self): return ' '.join(reversed([str(pipeline.plugin) for pipeline in self.pipelines]))
     def __iter__(self): return self.plugin.iter_with_prev(self.parent)
-    def read(*args): return self.plugin.read_with_prev(self.parent, *args)
-    def readline(*args): return self.plugin.read_with_prev(self.parent, *args)
+    def read(self, *args): return self.plugin.read_with_prev(self.parent, *args)
+    def readline(self, *args): return self.plugin.readline_with_prev(self.parent, *args)
 
 class StatusNoFiles(object):
     def __init__(self, fat, all):
@@ -272,7 +301,7 @@ class StatusNoFiles(object):
         self.catalog = set()
         self.catalog = self.fat.catalog_objects()
     def did_get_referenced(self, line):
-        fat, obj = line.split()
+        fat, obj = line.split(None, 1)
         self.obj2fat[obj] = fat
         if self.all:
             filename = self.obj2file[obj] if obj in self.obj2file else None
@@ -509,7 +538,7 @@ class GitFat(object):
         h = hashlib.new('sha1')
         bytes = 0
         fd, tmpname = tempfile.mkstemp(dir=self.objdir)
-        filenameSuffix = ' "%s"' % filename if filename else ''
+        suffix_for_verbose = ' "%s"' % filename if filename else ''
         try:
             ishanging = False
             cached = False                # changes to True when file is cached
@@ -530,13 +559,13 @@ class GitFat(object):
             objfile = os.path.join(self.objdir, digest)
             if not ishanging:
                 if os.path.exists(objfile):
-                    self.verbose('git-fat filter-clean: cache already exists %s%s' % (objfile, filenameSuffix))
+                    self.verbose('git-fat filter-clean: cache already exists %s%s' % (objfile, suffix_for_verbose))
                     os.remove(tmpname)
                 else:
                     # Set permissions for the new file using the current umask
                     os.chmod(tmpname, int('444', 8) & ~umask())
                     os.rename(tmpname, objfile)
-                    self.verbose('git-fat filter-clean: caching to %s%s' % (objfile, filenameSuffix))
+                    self.verbose('git-fat filter-clean: caching to %s%s' % (objfile, suffix_for_verbose))
                 cached = True
                 outstreamclean.write(self.encode(digest, bytes))
         finally:
@@ -553,17 +582,17 @@ class GitFat(object):
     def cmd_filter_smudge(self, filename=None):
         self.setup()
         result, bytes = self.decode_stream(sys.stdin)
-        filenameSuffix = ' "%s"' % filename if filename else ''
+        suffix_for_verbose = ' "%s"' % filename if filename else ''
         if isinstance(result, str):       # We got a digest
             objfile = os.path.join(self.objdir, result)
             try:
                 cat(open(objfile), sys.stdout)
-                self.verbose('git-fat filter-smudge: restoring from %s%s' % (objfile, filenameSuffix))
+                self.verbose('git-fat filter-smudge: restoring from %s%s' % (objfile, suffix_for_verbose))
             except IOError:                 # file not found
-                self.verbose('git-fat filter-smudge: fat object missing %s%s' % (objfile, filenameSuffix))
+                self.verbose('git-fat filter-smudge: fat object missing %s%s' % (objfile, suffix_for_verbose))
                 sys.stdout.write(self.encode(result, bytes))   # could leave a better notice about how to recover this file
         else:                             # We have an iterable over the original input.
-            self.verbose('git-fat filter-smudge: not a managed file%s' % filenameSuffix)
+            self.verbose('git-fat filter-smudge: not a managed file%s' % suffix_for_verbose)
             cat_iter(result, sys.stdout)
     def catalog_objects(self):
         return set(os.listdir(self.objdir))
