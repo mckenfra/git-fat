@@ -123,49 +123,15 @@ def gitconfig_set(name, value, file=None):
     args += [name, value]
     p = subprocess.check_call(args)
 
-class Async(object):
-    def __init__(self, plugin, parent=None):
-        self.plugin = plugin
-        self.parent = parent
-    def will_start_next(self, next_async):
-        if self.plugin.should_start_before_next(self): self.start(next_async)
-    def did_start_next(self, next_async):
-        if self.plugin.should_start_after_next(self): self.start(next_async)
-    def start(self, next_async=None):
-        if self.parent: self.parent.will_start_next(self)
-        self.plugin.start(self.parent, next_async)
-        if self.parent: self.parent.did_start_next(self)
-        return self
-    def wait(self):
-        for async in self.asyncs:
-            async.plugin.wait()
-    def get_root(self):
-        for async in self.asyncs:
-            root = async
-        return root
-    def get_asyncs(self):
-        async = self
-        while async:
-            yield async
-            async = async.parent
-    root = property(lambda self : self.get_root())
-    asyncs = property(lambda self : self.get_asyncs())
-    stdin = property(lambda self : self.plugin.stdin)
-    stdout = property(lambda self : self.plugin.stdout)
-    def __str__(self): return ' '.join(reversed([str(async.plugin) for async in self.asyncs]))
-    def __iter__(self): return self.plugin.iter_with_prev(self.parent)
-    def read(*args): return self.plugin.read_with_prev(self.parent, *args)
-    def readline(*args): return self.plugin.read_with_prev(self.parent, *args)
-
-class Pipeline(Async):
+class Pipeline(object):
     class Popen(object):
         def __init__(self, command):
             self.command = command.split() if isinstance(command, str) else command
             self.process = None
-        def start(self, prev_async, next_async):
-            if prev_async:
-                if prev_async.stdout:
-                    stdin = prev_async.stdout
+        def start(self, prev, next):
+            if prev:
+                if prev.stdout:
+                    stdin = prev.stdout
                 else:
                     stdin = subprocess.PIPE
             else:
@@ -173,18 +139,16 @@ class Pipeline(Async):
             self.process = subprocess.Popen(self.command, stdin=stdin, stdout=subprocess.PIPE)
         def wait(self):
             if self.process: self.process.wait()
-        def iter_with_prev(self, prev_async):
+        def iter_with_prev(self, prev):
             if self.process:
                 for line in self.process.stdout:
                     yield line
-        def read_with_prev(self, prev_async, *args):
-            if self.process:
-                return self.process.read(*args)
-        def readline_with_prev(self, prev_async, *args):
-            if self.process:
-                return self.process.readline(*args)
-        def should_start_before_next(self, next_async): return True
-        def should_start_after_next(self, next_async): return False
+        def read_with_prev(self, prev, *args):
+            if self.process: return self.process.read(*args)
+        def readline_with_prev(self, prev, *args):
+            if self.process: return self.process.readline(*args)
+        def should_start_before_next(self, next): return True
+        def should_start_after_next(self, next): return False
         stdin = property(lambda self : (self.process.stdin if self.process else None))
         stdout = property(lambda self : (self.process.stdout if self.process else None))
         def __str__(self): return ' '.join(self.command)
@@ -194,10 +158,10 @@ class Pipeline(Async):
             self.target = target
             self.thread = None
             self.reading = None
-        def start(self, prev_async, next_async):
-            if next_async:
-                stdin = prev_async.stdout
-                stdout = next_async.stdin
+        def start(self, prev, next):
+            if next:
+                stdin = prev.stdout
+                stdout = next.stdin
                 self.thread = threading.Thread(target=self.pipe_into, args=(stdin, stdout))
                 self.thread.start()
         def pipe_into(self, stdin, stdout):
@@ -206,24 +170,23 @@ class Pipeline(Async):
             stdout.close()
         def wait(self):
             if self.thread: self.thread.join()
-        def iter_with_prev(self, prev_async):
-            return self.target(prev_async.stdout)
-        def read_with_prev(self, prev_async, *args):
-            return self.readline_with_prev(prev_async, *args)
-        def readline_with_prev(self, prev_async, *args):
-            if not self.reading:
-                self.reading = self.target(prev_async.stdout)
+        def iter_with_prev(self, prev):
+            return self.target(prev.stdout)
+        def read_with_prev(self, prev, *args):
+            return self.readline_with_prev(prev, *args)
+        def readline_with_prev(self, prev, *args):
+            if not self.reading: self.reading = self.target(prev.stdout)
             return self.reading.__next__()
-        def should_start_before_next(self, next_async): return False
-        def should_start_after_next(self, next_async): return next_async
+        def should_start_before_next(self, next): return False
+        def should_start_after_next(self, next): return next
         stdin = property(lambda self : None)
         stdout = property(lambda self : None)
         def __str__(self): return self.target.__name__
 
     def __init__(self, command=None, plugin=None, parent=None):
-        if command:
-            plugin = Pipeline.Popen(command)
-        super(Pipeline, self).__init__(plugin, parent=parent)
+        if command: plugin = Pipeline.Popen(command)
+        self.plugin = plugin
+        self.parent = parent
     def pipe_into(self, command):
         return Pipeline(plugin=Pipeline.Popen(command), parent=self)
     def pipe_into_pipeline(self, pipeline):
@@ -231,6 +194,33 @@ class Pipeline(Async):
         return pipeline
     def filter_output(self, target):
         return Pipeline(plugin=Pipeline.FilterOutput(target), parent=self)
+    def will_start_next(self, next):
+        if self.plugin.should_start_before_next(self): self.start(next)
+    def did_start_next(self, next):
+        if self.plugin.should_start_after_next(self): self.start(next)
+    def start(self, next=None):
+        if self.parent: self.parent.will_start_next(self)
+        self.plugin.start(self.parent, next)
+        if self.parent: self.parent.did_start_next(self)
+        return self
+    def wait(self):
+        for pipeline in self.pipelines: pipeline.plugin.wait()
+    def get_root(self):
+        for pipeline in self.pipelines: root = pipeline
+        return root
+    def get_pipelines(self):
+        pipeline = self
+        while pipeline:
+            yield pipeline
+            pipeline = pipeline.parent
+    root = property(lambda self : self.get_root())
+    pipelines = property(lambda self : self.get_pipelines())
+    stdin = property(lambda self : self.plugin.stdin)
+    stdout = property(lambda self : self.plugin.stdout)
+    def __str__(self): return ' '.join(reversed([str(pipeline.plugin) for pipeline in self.pipelines]))
+    def __iter__(self): return self.plugin.iter_with_prev(self.parent)
+    def read(*args): return self.plugin.read_with_prev(self.parent, *args)
+    def readline(*args): return self.plugin.read_with_prev(self.parent, *args)
 
 class StatusNoFiles(object):
     def __init__(self, fat, all):
@@ -400,7 +390,7 @@ class StatusWithFiles(object):
 class GitFat(object):
     DecodeError = RuntimeError
     def __init__(self, verbose=False):
-        self.verbose = verbose_stderr if os.environ.get('GIT_FAT_VERBOSE') or verbose else verbose_ignore
+        self.verbose = verbose_stderr if verbose else verbose_ignore
         try:
             self.gitroot = subprocess.check_output('git rev-parse --show-toplevel'.split()).strip()
         except subprocess.CalledProcessError:
