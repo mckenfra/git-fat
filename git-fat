@@ -52,16 +52,16 @@ class Enum(object):
     def __str__(self): return self.name
 
 class FatState(Enum):
-    OK = Enum('ok')
-    ORPHAN = Enum('orph')
-    GARBAGE = Enum('crud')
-    NOTFAT = Enum('....')
+    OK      = Enum('fat')
+    MISSING = Enum('missing')
+    GARBAGE = Enum('garbage')
+    NOTFAT  = Enum('.......')
 
 class FileState():
-    OK = Enum('ok')
-    STUB = Enum('stub')
-    DIFF = Enum('diff')
-    NOTFAT = Enum('....')
+    OK     = Enum('ok')
+    ORPHAN = Enum('orphan')
+    DIFF   = Enum('diff')
+    NOTFAT = Enum('......')
 
 class Style():
     BOLD = '\33[1m'
@@ -399,9 +399,9 @@ class StatusWithFiles(object):
     def did_get_referenced_file(self, fat, file, size):
         fatfile = os.path.join(self.fat.objdir, fat)
         digest, bytes, filesize = self.fat.decode_file(file)
-        fatstate = FatState.OK if os.path.exists(fatfile) else FatState.ORPHAN
+        fatstate = FatState.OK if os.path.exists(fatfile) else FatState.MISSING
         if digest:
-            filestate = FileState.STUB
+            filestate = FileState.ORPHAN
         else:
             if filesize != int(size):
                 filestate = FileState.DIFF
@@ -412,7 +412,9 @@ class StatusWithFiles(object):
     def run(self):
         dirs = set()
         files = set()
+        rootdir = os.path.dirname(os.path.abspath(self.fat.gitdir))
         for path in self.paths:
+            path = os.path.relpath(os.path.abspath(path), rootdir)
             dirs.add(path) if os.path.isdir(path) else files.add(path)
         if files:
             self.run_with_files(files)
@@ -451,15 +453,18 @@ class StatusWithFiles(object):
     def print_error(self, msg, fname):
         self.print_fat('error', (' ' + msg + ' ').center(40, '-'), fname)
     def print_fat(self, hash, fname, fatstate, filestate):
-        if fatstate == FatState.ORPHAN:
+        if fatstate == FatState.MISSING:
             if filestate == FileState.DIFF:
                 style = Style.RED + Style.BOLD
             else:
                 style = Style.YELLOW
             clearstyle = Style.RESET
+        elif filestate == FileState.ORPHAN:
+            style = Style.RED + Style.BOLD
+            clearstyle = Style.RESET
         else:
             style = clearstyle = ''
-        print('%s[%s] [%s]  %s  "%s"%s' % (style, str(filestate).center(4), str(fatstate).center(4), hash, fname, clearstyle))
+        print('%s[%s] [%s]  %s  "%s"%s' % (style, str(filestate).center(6), str(fatstate).center(7), hash, fname, clearstyle))
 
 class GitFat(object):
     DecodeError = RuntimeError
