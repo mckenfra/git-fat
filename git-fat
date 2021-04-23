@@ -15,6 +15,10 @@ import threading
 import time
 import collections
 import unicodedata
+try:
+    from Queue import Queue # Python 2
+except ImportError:
+    from queue import Queue # Python 3
 
 if not type(sys.version_info) is tuple and sys.version_info.major > 2:
     sys.stderr.write('git-fat does not support Python-3 yet.  Please use python2.\n')
@@ -48,20 +52,10 @@ except ImportError:
 BLOCK_SIZE = 4096
 
 class Enum(object):
-    def __init__(self, name): self.name = name
+    def __init__(self, name, **kwargs):
+        self.name = name
+        for key in kwargs: setattr(self, key, kwargs[key])
     def __str__(self): return self.name
-
-class FatState(Enum):
-    OK      = Enum('fat')
-    MISSING = Enum('missing')
-    GARBAGE = Enum('garbage')
-    NOTFAT  = Enum('.......')
-
-class FileState():
-    OK     = Enum('ok')
-    ORPHAN = Enum('orphan')
-    DIFF   = Enum('diff')
-    NOTFAT = Enum('......')
 
 class Style():
     BOLD = '\33[1m'
@@ -76,6 +70,40 @@ class Style():
     UNDERLINE = '\033[4m'
     RESET = '\033[0m'
 
+class FatStatus(Enum):
+    OK      = Enum('here')
+    MISSING = Enum('lost')
+    GARBAGE = Enum('junk')
+    NOTFAT  = Enum('')
+
+class FileStatus():
+    OK      = Enum('here')
+    ORPHAN  = Enum('stub')
+    DIFF    = Enum('diff')
+    NOTFAT  = Enum('thin')
+
+class PrintStatus():
+    DEFAULT = Enum('default', is_error=False, style=None)
+    OK      = Enum('ok',      is_error=False, style=Style.GREEN + Style.BOLD)
+    WARN3   = Enum('warn3',   is_error=True,  style=Style.CYAN)
+    WARN2   = Enum('warn2',   is_error=True,  style=Style.BLUE)
+    WARN    = Enum('warn',    is_error=True,  style=Style.YELLOW + Style.BOLD)
+    ERROR   = Enum('error',   is_error=True,  style=Style.RED + Style.BOLD)
+
+def print_status(status, *args, **kwargs):
+    if status and status.is_error and not 'file' in kwargs:
+        kwargs['file'] = sys.stderr
+    if status and status.style and args:
+        style = status.style
+        file = kwargs['file'] if 'file' in kwargs else None
+        end = kwargs.pop('end') if 'end' in kwargs else None
+        kwargs['end'] = ''
+    else:
+        style = None
+    if style: print(style, file=file, end='')
+    result = print(*args, **kwargs)
+    if style: print(Style.RESET, file=file, end=end)
+    return result
 def verbose_stderr(*args, **kwargs):
     return print(*args, file=sys.stderr, **kwargs)
 def verbose_ignore(*args, **kwargs):
@@ -152,6 +180,12 @@ def gitconfig_set(name, value, file=None):
     args += [name, value]
     p = subprocess.check_call(args)
 
+class ThreadWithResult(threading.Thread):
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs={}):
+        def function():
+            self.result = target(*args, **kwargs)
+        super(ThreadWithResult, self).__init__(group=group, target=function, name=name)
+
 class Pipeline(object):
     class Popen(object):
         def __init__(self, command):
@@ -178,6 +212,7 @@ class Pipeline(object):
             if self.process: return self.process.stdout.readline(*args)
         def should_start_before_next(self, next): return True
         def should_start_after_next(self, next): return False
+        uses_pipes = property(lambda self : True)
         stdin = property(lambda self : (self.process.stdin if self.process else None))
         stdout = property(lambda self : (self.process.stdout if self.process else None))
         def __str__(self): return ' '.join(self.command)
@@ -196,11 +231,12 @@ class Pipeline(object):
             size = args[0] if args else -1
             if size == 0: return ''
             if size < 0: return self.readall()
+            result = self.remaining
             while len(result) < size:
                 data = self.iterator.__next__()
                 if data:
-                  result += data + '\n'
-                  if oneline: break
+                    result += data + '\n'
+                    if oneline: break
                 else: break
             if len(result) >= size:
                 self.remaining = result[size:]
@@ -215,8 +251,8 @@ class Pipeline(object):
             self.thread = None
             self.reader = None
         def start(self, prev, next):
-            if next:
-                stdin = prev.stdout
+            if next and next.stdin:
+                stdin = prev.stdout or prev
                 stdout = next.stdin
                 self.thread = threading.Thread(target=self.pipe_into, args=(stdin, stdout))
                 self.thread.start()
@@ -227,35 +263,41 @@ class Pipeline(object):
         def wait(self):
             if self.thread: self.thread.join()
         def iter_with_prev(self, prev):
-            for line in self.target(prev):
-                yield line.rstrip()
+            for line in self.target(prev.stdout or prev):
+                yield line.rstrip('\n\r')
         def read_with_prev(self, prev, *args):
             if not self.reader: self.reader = Pipeline.IteratorReader(self.target(prev))
             return self.reader.read(*args)
         def readline_with_prev(self, prev, *args):
             if not self.reader: self.reader = Pipeline.IteratorReader(self.target(prev))
             return self.reader.readline(*args)
-        def should_start_before_next(self, next): return False
-        def should_start_after_next(self, next): return next
+        def should_start_before_next(self, next): return next and not next.uses_pipes
+        def should_start_after_next(self, next): return next and next.uses_pipes
+        uses_pipes = property(lambda self : False)
         stdin = property(lambda self : None)
         stdout = property(lambda self : None)
         def __str__(self): return self.target.__name__
 
-    def __init__(self, command=None, plugin=None, parent=None):
-        if command: plugin = Pipeline.Popen(command)
+    def __init__(self, plugin, parent):
         self.plugin = plugin
         self.parent = parent
+    @staticmethod
+    def Process(command, parent=None):
+        return Pipeline(Pipeline.Popen(command), parent)
+    @staticmethod
+    def Filter(target, parent=None):
+        return Pipeline(Pipeline.FilterOutput(target), parent)
     def pipe_into(self, command):
-        return Pipeline(plugin=Pipeline.Popen(command), parent=self)
+        return Pipeline.Process(command, self)
     def pipe_into_pipeline(self, pipeline):
         pipeline.root.parent = self
         return pipeline
     def filter_output(self, target):
-        return Pipeline(plugin=Pipeline.FilterOutput(target), parent=self)
+        return Pipeline.Filter(target, self)
     def will_start_next(self, next):
-        if self.plugin.should_start_before_next(self): self.start(next)
+        if self.plugin.should_start_before_next(next): self.start(next)
     def did_start_next(self, next):
-        if self.plugin.should_start_after_next(self): self.start(next)
+        if self.plugin.should_start_after_next(next): self.start(next)
     def start(self, next=None):
         if self.parent: self.parent.will_start_next(self)
         self.plugin.start(self.parent, next)
@@ -273,198 +315,13 @@ class Pipeline(object):
             pipeline = pipeline.parent
     root = property(lambda self : self.get_root())
     pipelines = property(lambda self : self.get_pipelines())
+    uses_pipes = property(lambda self : self.plugin.uses_pipes)
     stdin = property(lambda self : self.plugin.stdin)
     stdout = property(lambda self : self.plugin.stdout)
-    def __str__(self): return ' '.join(reversed([str(pipeline.plugin) for pipeline in self.pipelines]))
+    def __str__(self): return '\n'.join(reversed([str(pipeline.plugin) for pipeline in self.pipelines]))
     def __iter__(self): return self.plugin.iter_with_prev(self.parent)
     def read(self, *args): return self.plugin.read_with_prev(self.parent, *args)
     def readline(self, *args): return self.plugin.readline_with_prev(self.parent, *args)
-
-class StatusNoFiles(object):
-    def __init__(self, fat, all):
-        self.fat = fat
-        self.all = all
-        self.obj2fat = dict()
-        self.obj2file = None
-    def populate_obj2file(self, obj, fname):
-        if fname:
-            if not self.obj2file:
-                self.obj2file = dict()
-            self.obj2file[obj] = fname
-        return True
-    def print_fat_with_filename(self, fat, indent='', obj=None, fname=None):
-        suffix = ' "' + fname + '"' if fname else ' obj=' + obj if obj else ' file not found'
-        print(indent + fat + suffix)
-    def print_fats(self, fathashes, indent='', with_filenames=False):
-        if with_filenames:
-            if self.obj2file:
-                # Have filenames already
-                if not self.fat2obj:
-                    self.fat2obj = dict([(self.obj2fat[obj], obj) for obj in self.obj2fat])
-                for fat in fathashes:
-                    obj = self.fat2obj[fat] if fat in self.fat2obj else None
-                    filename = self.obj2file[obj] if obj and obj in self.obj2file else None
-                    self.print_fat_with_filename(fat, indent, obj, filename)
-            else:
-                # Lookup filenames
-                rev_list = Pipeline('git rev-list --objects --all').start()
-                found = set()
-                for line in rev_list:
-                    splits = line.split(None, 1)
-                    if len(splits) == 2 and splits[0] in self.obj2fat:
-                        fat = self.obj2fat[splits[0]]
-                        if fat in fathashes:
-                            self.print_fat_with_filename(fat, indent, splits[0], splits[1].rstrip())
-                            found.add(fat)
-                rev_list.wait()
-
-                # Filename not found
-                for fat in fathashes:
-                    if fat not in found:
-                        self.print_fat_with_filename(fat, indent, None, None)
-        else:
-            # No filenames
-            for fat in fathashes:
-                print(indent + fat)
-    def load_catalog(self):
-        self.catalog = set()
-        self.catalog = self.fat.catalog_objects()
-    def did_get_referenced(self, line):
-        fat, obj, size = line.split(None, 2)
-        self.obj2fat[obj] = fat
-        if self.all:
-            filename = self.obj2file[obj] if obj in self.obj2file else None
-            self.print_fat_with_filename(fat, '', obj, filename)
-    def run(self):
-        load_catalog = threading.Thread(target=self.load_catalog)
-        load_catalog.start()
-        on_filename = self.populate_obj2file if self.all else None
-        load_obj2fat = self.fat.referenced_objects_pipeline(all=self.all, on_filename=on_filename).start()
-        for referenced in load_obj2fat:
-            self.did_get_referenced(referenced)
-        load_catalog.join()
-        load_obj2fat.wait()
-        referenced = set(self.obj2fat.values())
-        orphans = referenced - self.catalog
-        garbage = self.catalog - referenced
-        if orphans:
-            print('Orphan objects:')
-            self.print_fats(orphans, '    ', True)
-        if garbage:
-            print('Garbage objects:')
-            self.print_fats(garbage, '    ', False)
-
-class StatusWithFiles(object):
-    def __init__(self, fat, files):
-        self.fat = fat
-        self.paths = set(files)
-        self.referenced_objects_only = False
-    def cut_sha1hash(self, input):
-        # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
-        part_index = 0
-        file = obj = None
-        for line in input:
-            for part in line.split('\x00'):
-                if not part:
-                    break; # EOF
-                if part_index == 0:
-                    mode, obj, stage, file = part.split(None, 3)
-                    if mode.startswith('100'):
-                        file = file.rstrip()
-                    else:
-                        file = obj = None
-                elif part_index == 1:
-                    if file and part != 'filter':
-                        file = obj = None
-                elif part_index == 2:
-                    if file and (part == 'fat' or not self.referenced_objects_only):
-                        file_or_files = self.obj2file_or_files[obj] if obj in self.obj2file_or_files else None
-                        if file_or_files:
-                            if isinstance(file_or_files, list):
-                                file_or_files.append(file)
-                            else:
-                                self.obj2file_or_files[obj] = [file_or_files, file]
-                        else:
-                            self.obj2file_or_files[obj] = file
-                            yield obj + '\n'
-                part_index = (part_index + 1) % 3
-    def did_get_referenced(self, line):
-        fat, obj, size = line.split()
-        file_or_files = self.obj2file_or_files[obj]
-        if isinstance(file_or_files, list):
-            for file in file_or_files:
-                self.did_get_referenced_file(fat, file, size)
-        else:
-            self.did_get_referenced_file(fat, file_or_files, size)
-    def did_get_referenced_file(self, fat, file, size):
-        fatfile = os.path.join(self.fat.objdir, fat)
-        digest, bytes, filesize = self.fat.decode_file(file)
-        fatstate = FatState.OK if os.path.exists(fatfile) else FatState.MISSING
-        if digest:
-            filestate = FileState.ORPHAN
-        else:
-            if filesize != int(size):
-                filestate = FileState.DIFF
-            else:
-                filestate = FileState.OK
-        self.print_fat(fat, file, fatstate, filestate)
-        self.fat_files.add(file)
-    def run(self):
-        dirs = set()
-        files = set()
-        rootdir = os.path.dirname(os.path.abspath(self.fat.gitdir))
-        for path in self.paths:
-            path = os.path.relpath(os.path.abspath(path), rootdir)
-            dirs.add(path) if os.path.isdir(path) else files.add(path)
-        if files:
-            self.run_with_files(files)
-        files = None # Free memory
-        for dir in dirs:
-            self.run_with_files(set(dir), is_dir=True)
-    def run_with_files(self, files, is_dir=False): #dir=None):
-        self.fat_files = set()
-        self.obj2file_or_files = dict()
-        self.referenced_objects_only = is_dir
-        get_referenced = Pipeline(['git','ls-files','-s','-z'] + list(files)) \
-            .pipe_into('git check-attr --stdin -z filter') \
-            .filter_output(self.cut_sha1hash) \
-            .pipe_into_pipeline(self.fat.referenced_objects_from_hashes_pipeline()) \
-            .start()
-        for referenced in get_referenced:
-            self.did_get_referenced(referenced)
-        get_referenced.wait()
-
-        # Not fat
-        file2obj = self.file2obj_from_obj2file_or_files()
-        unmatched = (set(file2obj.keys()) if is_dir else files) - self.fat_files
-        for file in unmatched:
-          if file in file2obj:
-              filehash = self.fat.file_hash(file)
-              if not filehash or not os.path.exists(os.path.join(self.fat.objdir, filehash)):
-                  self.print_fat(filehash, file, FileState.NOTFAT, FileState.NOTFAT)
-              else:
-                  self.print_fat(filehash, file, FatState.GARBAGE, FileState.NOTFAT)
-          else:
-              self.print_fat('.' * 40, file, FileState.NOTFAT, FileState.NOTFAT)
-    def file2obj_from_obj2file_or_files(self):
-        return dict([
-            file2obj for file_or_files2obj in ((self.obj2file_or_files[obj],obj) for obj in self.obj2file_or_files.keys()) for file2obj in (((file,file_or_files2obj[1]) for file in file_or_files2obj[0]) if isinstance(file_or_files2obj[0], list) else [file_or_files2obj])
-        ])
-    def print_error(self, msg, fname):
-        self.print_fat('error', (' ' + msg + ' ').center(40, '-'), fname)
-    def print_fat(self, hash, fname, fatstate, filestate):
-        if fatstate == FatState.MISSING:
-            if filestate == FileState.DIFF:
-                style = Style.RED + Style.BOLD
-            else:
-                style = Style.YELLOW
-            clearstyle = Style.RESET
-        elif filestate == FileState.ORPHAN:
-            style = Style.RED + Style.BOLD
-            clearstyle = Style.RESET
-        else:
-            style = clearstyle = ''
-        print('%s[%s] [%s]  %s  "%s"%s' % (style, str(filestate).center(6), str(fatstate).center(7), hash, fname, clearstyle))
 
 class GitFat(object):
     DecodeError = RuntimeError
@@ -652,41 +509,67 @@ class GitFat(object):
         return set(os.listdir(self.objdir))
     def referenced_objects(self, rev=None, all=False):
         get_referenced = self.referenced_objects_pipeline(rev, all).start()
-        referenced = set([line.split(None, 1)[0] for line in get_referenced])
+        referenced = set([line.split('\t', 1)[0] for line in get_referenced])
         get_referenced.wait()
         return referenced
-    def referenced_objects_pipeline(self, rev=None, all=False, on_filename=None):
+    def referenced_objects_pipeline(self, rev=None, all=False, with_filenames=False):
+        return self.objects_pipeline(rev, all, referenced_only=True, with_filenames=with_filenames)
+    def objects_pipeline(self, rev=None, all=False, referenced_only=False, with_filenames=False):
         if all:
             rev = '--all'
         elif rev is None:
             rev = self.revparse('HEAD')
 
+        # Revision list gives us objects to inspect with cat-file
+        return Pipeline.Process(['git','rev-list','--objects',rev]) \
+            .pipe_into_pipeline(self.objects_from_revlist_pipeline(referenced_only, with_filenames))
+    def objects_from_revlist_pipeline(self, referenced_only=False, with_filenames=False):
+        with_fileinfos = with_filenames or not referenced_only
+        if with_filenames: filenames_queue = Queue()
+        if with_fileinfos: fileinfos_queue = Queue()
+
         def cut_sha1hash(input):
             for line in input:
-                parts = line.split(None, 1)
+                parts = line.split(None, 1) # objhash, filename_with_spaces_and_newline
                 objhash = parts[0]
-                if objhash:
-                    if on_filename and len(parts) > 1:
-                        on_filename(objhash, parts[1].rstrip())
-                    yield objhash + '\n'
-
-        # Revision list gives us objects to inspect with cat-file
-        return Pipeline(['git','rev-list','--objects',rev]) \
-            .filter_output(cut_sha1hash) \
-            .pipe_into_pipeline(self.referenced_objects_from_hashes_pipeline())
-    def referenced_objects_from_hashes_pipeline(self):
+                if with_filenames:
+                    filename = parts[1].rstrip() if len(parts) > 1 else ''
+                    filenames_queue.put((objhash, filename))
+                yield objhash + '\n'
         def filter_gitfat_candidates(input):
             for line in input:
-                objhash, objtype, size = line.split()
-                if objtype == 'blob' and int(size) in self.magiclens:
-                    yield objhash + '\n'
+                parts = line.split() # objhash, objtype, size, \n
+                if len(parts) < 3:
+                    # Invalid file
+                    if with_filenames: filenames_queue.get_nowait() # Discard
+                else:
+                    objhash, objtype, size = parts
+                    if with_fileinfos:
+                        queued_obj, queued_filename = filenames_queue.get_nowait() if with_filenames else ('','')
+                        fileinfos_queue.put((objhash, size, queued_filename))
+                    if objtype == 'blob' and int(size) in self.magiclens:
+                        yield objhash + '\n'
         def extract_fathashes_from_gitfat_refs(input):
+            UNREFERENCED = '\t0\t%s\t%s\t%s\n'
+            REFERENCED = '%s\t%s\t%s\t%s\t%s\n'
+
             # Process metadata + content format provided by `cat-file --batch`
             while True:
                 metadata_line = input.readline()
                 if not metadata_line:
                     break  # EOF
                 objhash, objtype, size_str = metadata_line.split()
+                filename = ''
+                if with_fileinfos:
+                    # Get filename if matches referenced, else flush all unreferenced
+                    while True:
+                        queued_obj, queued_size, queued_filename = fileinfos_queue.get_nowait()
+                        if queued_obj == objhash:
+                            filename = queued_filename
+                            break
+                        elif not referenced_only:
+                            yield UNREFERENCED % (queued_obj, queued_size, queued_filename)
+
                 size, bytes_read = int(size_str), 0
                 # We know from filter that item is a candidate git-fat object and
                 # is small enough to read into memory and process
@@ -698,11 +581,14 @@ class GitFat(object):
                     content += data
                     bytes_read += len(data)
                 try:
-                    fathash, bytes = self.decode(content)
-                    yield '%s %s %s\n' % (fathash, objhash, bytes)
+                    fathash, fatbytes = self.decode(content)
+                    yield REFERENCED % (fathash, fatbytes, objhash, size_str, filename)
                 except GitFat.DecodeError:
                     self.verbose('decode error: %s' % objhash)
-                    pass
+                    if not referenced_only:
+                        yield UNREFERENCED % (objhash, size_str, filename)
+                    else:
+                        pass
                 # Consume LF record delimiter in `cat-file --batch` output
                 bytes_read = 0
                 while bytes_read < 1:
@@ -710,12 +596,20 @@ class GitFat(object):
                     if not data:
                         break  # EOF
                     bytes_read += len(data)
+            # Yield remaining unreferenced fileinfos
+            if with_fileinfos:
+                while not fileinfos_queue.empty():
+                    objhash, size, filename = fileinfos_queue.get()
+                    if not referenced_only:
+                        yield UNREFERENCED % (objhash, size, filename)
 
-        # 1. Get info for git-fat candidates in bulk
-        # 2. Analyse info to identify git-fat candidates
-        # 3. Get full contents of identified git-fat candidates in bulk
-        # 4. Extract fathash from contents
-        return Pipeline('git cat-file --batch-check') \
+        # 1. Cut hash from revlist input
+        # 2. Get info for git-fat candidates in bulk
+        # 3. Analyse info to identify git-fat candidates
+        # 4. Get full contents of identified git-fat candidates in bulk
+        # 5. Extract fathash using file metadata and contents
+        return Pipeline.Filter(cut_sha1hash) \
+            .pipe_into('git cat-file --batch-check') \
             .filter_output(filter_gitfat_candidates) \
             .pipe_into('git cat-file --batch') \
             .filter_output(extract_fathashes_from_gitfat_refs)
@@ -732,13 +626,115 @@ class GitFat(object):
     def cmd_status(self, args):
         self.setup()
         if '--all' in args:
-            status = StatusNoFiles(fat=self, all=True)
+            self.status_no_paths(all=True)
         elif args:
-            status = StatusWithFiles(fat=self, files=args)
+            self.status_for_paths(args)
         else:
-            status = StatusNoFiles(fat=self, all=False)
-        status.run()
+            self.status_no_paths(all=False)
+    def status_no_paths(self, all=False):
+        def print_fat_with_filename(fat, indent=0, obj=None, filename=None):
+            indent_str = ' ' * indent if indent > 0 else ''
+            filename_str = '"%s"' % filename if filename else filename if filename is not None else 'obj=%s' % obj if obj else 'file not found'
+            print('%s%s%s' % (indent_str, fat, (' %s' % filename_str) if filename_str else ''))
+        def did_get_metadata_line(line):
+            fat, fatsize, obj, objsize, filename = line.split('\t', 4)
+            if all:
+                print_fat_with_filename(fat, obj=obj, filename=filename.rstrip())
+            return (fat, filename)
+        load_catalog = ThreadWithResult(target=lambda : self.catalog_objects())
+        load_catalog.start()
+        load_referenced = self.referenced_objects_pipeline(all=all, with_filenames=all).start()
+        fat2file = dict([did_get_metadata_line(line) for line in load_referenced])
+        referenced = set(fat2file.keys())
+        load_catalog.join()
+        load_referenced.wait()
+        catalog = load_catalog.result
+        orphans = referenced - catalog
+        garbages = catalog - referenced
+        if orphans:
+            print('Orphan objects:')
+            for orphan in orphans:
+                print_fat_with_filename(orphan, indent=6, filename=fat2file[orphan])
+        if garbages:
+            print('Garbage objects:')
+            for garbage in garbages:
+                print_fat_with_filename(garbage, indent=6, filename='')
+    def status_for_paths(self, paths):
+        def having_fat_filter(input):
+            # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
+            part_index = 0
+            filename = obj = None
+            for line in input:
+                yield 'francis sucks\n'
+                for part in line.split('\x00'):
+                    if not part:
+                        break; # EOF
+                    if part_index == 0:
+                        mode, obj, stage, filename = part.split(None, 3)
+                        if mode.startswith('100'):
+                            filename = filename.rstrip()
+                        else:
+                            filename = obj = None
+                    elif part_index == 1:
+                        if filename and part != 'filter':
+                            filename = obj = None
+                    elif part_index == 2:
+                        if filename and part == 'fat':
+                            yield '%s %s\n' % (obj, filename)
+                    part_index = (part_index + 1) % 3
+        def did_get_metadata_line(line):
+            fat, fatsize, obj, objsize, filename = line.split('\t')
+            if not filename: return
+            if fat:
+                fatfile = os.path.join(self.objdir, fat)
+                fatstatus = FatStatus.OK if os.path.exists(fatfile) else FatStatus.MISSING
+                fat_from_file, fatsize_from_file, filesize = self.decode_file(filename)
+                if fat_from_file:
+                    filestatus = FileStatus.ORPHAN
+                else:
+                    if filesize != int(fatsize):
+                        filestatus = FileStatus.DIFF
+                    else:
+                        filestatus = FileStatus.OK
+                print_fat(fat, filename, fatstatus, filestatus)
+            else:
+                filehash = self.file_hash(filename)
+                if not filehash or not os.path.exists(os.path.join(self.objdir, filehash)):
+                    print_fat(filehash, filename, FatStatus.NOTFAT, FileStatus.NOTFAT)
+                else:
+                    print_fat(filehash, filename, FatStatus.GARBAGE, FileStatus.NOTFAT)
+        def print_fat(hash, fname, fatstatus, filestatus):
+            if fatstatus == FatStatus.MISSING:
+                if filestatus == FileStatus.DIFF:
+                    status = PrintStatus.ERROR
+                else:
+                    status = PrintStatus.WARN
+            elif filestatus == FileStatus.ORPHAN:
+                if fatstatus == FatStatus.MISSING:
+                    status = PrintStatus.ERROR
+                else:
+                    status = PrintStatus.WARN
+            elif fatstatus == FatStatus.GARBAGE:
+                status = PrintStatus.WARN2
+            elif filestatus == FileStatus.NOTFAT:
+                status = PrintStatus.WARN3
+            else:
+                status = PrintStatus.DEFAULT
+            if status.is_error:
+                status_str = 'x-%s-%s' % (str(filestatus).center(4, '-'), str(fatstatus).center(4, '-'))
+            else:
+                status_str = '-' * 11
+            print_status(status, '%s %s "%s"' % (status_str, hash, fname))
 
+        paths = [os.path.relpath(os.path.abspath(path), '.') for path in paths]
+        get_metadata = Pipeline.Process(['git','ls-files','-s','-z'] + list(paths)) \
+            .pipe_into('git check-attr --stdin -z filter') \
+            .filter_output(having_fat_filter) \
+            .pipe_into_pipeline(self.objects_from_revlist_pipeline(referenced_only=False, with_filenames=True)) \
+            .start()
+        for line in get_metadata:
+            did_get_metadata_line(line)
+        get_metadata.wait()
     def is_dirty(self):
         return subprocess.call(['git', 'diff-index', '--quiet', 'HEAD']) == 0
     def cmd_push(self, args):
@@ -885,7 +881,7 @@ class GitFat(object):
         time0 = time.time()
         # Find all names assumed by large blobs (those in blobsizes)
         pathsizes = collections.defaultdict(lambda:set())
-        difftree = Pipeline(['git', 'rev-list', '--all']) \
+        difftree = Pipeline.Process(['git', 'rev-list', '--all']) \
             .pipe_into(['git', 'diff-tree', '--root', '--no-renames', '--no-commit-id', '--diff-filter=AMCR', '-r', '--stdin', '-z']) \
             .start()
         for newblob, modflag, path in difftreez_reader(difftree.stdout):
