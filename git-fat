@@ -436,6 +436,20 @@ class GitFat(object):
             return digest, bytes, filesize
         else:
             return None, bytes, filesize
+    def decode_index_file(self, filename):
+        filesize = 0
+        metadata = subprocess.check_output(['git', 'ls-files', '-s', filename])
+        if metadata:
+            objhash = metadata.split(None, 2)[1]
+            filesize = int(subprocess.check_output(['git', 'cat-file', '-s', objhash]))
+            if filesize == self.magiclen:
+                content = subprocess.check_output(['git', 'cat-file', '-p', objhash])
+                try:
+                    digest, bytes = self.decode(content)
+                    return digest, bytes, filesize
+                except GitFat.DecodeError:
+                    pass
+        return False, None, filesize
     def decode_clean(self, body):
         '''
         Attempt to decode version in working tree. The tree version could be changed to have a more
@@ -461,6 +475,13 @@ class GitFat(object):
                         if len(block) == self.magiclen and self.decode_clean(block[0:self.magiclen]):
                             ishanging = True              # Working tree version is verbatim from repository (not smudged)
                             outstream = outstreamclean
+                        elif filename:
+                            # If previously added without using fat, don't try to convert it to fat now
+                            digest, _, filesize = self.decode_index_file(filename)
+                            if not digest and filesize > 0:
+                                self.verbose('git-fat filter-clean: skipping because previously added as non-fat file %s' % filename)
+                                ishanging = True
+                                outstream = outstreamclean
                         firstblock = False
                     h.update(block)
                     bytes += len(block)
