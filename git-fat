@@ -479,7 +479,7 @@ class GitFat(object):
                             # If previously added without using fat, don't try to convert it to fat now
                             digest, _, filesize = self.decode_index_file(filename)
                             if not digest and filesize > 0:
-                                self.verbose('git-fat filter-clean: skipping because previously added as non-fat file %s' % filename)
+                                self.verbose('git-fat filter-clean: skipping because previously added as non-fat file "%s"' % filename)
                                 ishanging = True
                                 outstream = outstreamclean
                         firstblock = False
