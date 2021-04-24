@@ -58,6 +58,8 @@ class Enum(object):
         self.name = name
         for key in kwargs: setattr(self, key, kwargs[key])
     def __str__(self): return self.name
+    @staticmethod
+    def todict(*args): return dict([(enum.name,enum) for enum in args])
 
 class Style():
     BOLD = '\33[1m'
@@ -76,13 +78,15 @@ class FatStatus(Enum):
     OK      = Enum('here')
     MISSING = Enum('lost')
     GARBAGE = Enum('junk')
-    NOTFAT  = Enum('')
+    NOTFAT  = Enum('----')
+    byname  = Enum.todict(OK, MISSING, GARBAGE, NOTFAT)
 
 class FileStatus():
     OK      = Enum('here')
     ORPHAN  = Enum('stub')
     DIFF    = Enum('diff')
     NOTFAT  = Enum('thin')
+    byname  = Enum.todict(OK, ORPHAN, DIFF, NOTFAT)
 
 class PrintStatus():
     DEFAULT = Enum('default', is_error=False, style=None)
@@ -656,6 +660,93 @@ class GitFat(object):
             .pipe_into('git cat-file --batch') \
             .filter_output(extract_fathashes_from_gitfat_refs)
 
+    def file_status_pipeline(self, paths='.'):
+        def having_fat_filter(input):
+            # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
+            part_index = 0
+            filename = obj = None
+            for line in input:
+                for part in line.split('\x00'):
+                    if not part:
+                        break; # EOF
+                    if part_index == 0:
+                        mode, obj, stage, filename = part.split(None, 3)
+                        if mode.startswith('100'):
+                            filename = filename.rstrip()
+                        else:
+                            filename = obj = None
+                    elif part_index == 1:
+                        if filename and part != 'filter':
+                            filename = obj = None
+                    elif part_index == 2:
+                        if filename and part == 'fat':
+                            yield '%s %s\n' % (obj, filename)
+                    part_index = (part_index + 1) % 3
+        def add_status(input):
+            for line in input:
+                fat, fatsize, obj, objsize, filename = line.split('\t')
+                if not filename: continue
+                if fat:
+                    fatfile = os.path.join(self.objdir, fat)
+                    fatstatus = FatStatus.OK if os.path.exists(fatfile) else FatStatus.MISSING
+                    fat_from_file, fatsize_from_file, filesize = self.decode_file(filename)
+                    if fat_from_file:
+                        filestatus = FileStatus.ORPHAN
+                    else:
+                        if filesize != int(fatsize):
+                            filestatus = FileStatus.DIFF
+                        else:
+                            filestatus = FileStatus.OK
+                else:
+                    filestatus = FileStatus.NOTFAT
+                    filehash = self.file_hash(filename)
+                    if filehash and os.path.exists(os.path.join(self.objdir, filehash)):
+                        fatstatus = FatStatus.GARBAGE
+                    else:
+                        fatstatus = FatStatus.NOTFAT
+                status = self.encode_status(filestatus, fatstatus)
+                yield '%s\t%s\n' % (status, line)
+        paths = [os.path.relpath(os.path.abspath(path), '.') for path in paths]
+        return Pipeline.Process(['git','ls-files','-s','-z'] + list(paths)) \
+            .pipe_into('git check-attr --stdin -z filter') \
+            .filter_output(having_fat_filter) \
+            .pipe_into_pipeline(self.objects_from_revlist_pipeline(referenced_only=False, with_filenames=True)) \
+            .filter_output(add_status)
+
+    def print_file_status(self, status, fat, obj, filename):
+        filestatus, fatstatus = self.decode_status(status)
+        if fatstatus == FatStatus.NOTFAT:
+            printstatus = PrintStatus.WARN3
+        elif fatstatus == FatStatus.GARBAGE:
+            printstatus = PrintStatus.WARN2
+        elif fatstatus == FatStatus.MISSING:
+            if filestatus == FileStatus.DIFF:
+                printstatus = PrintStatus.ERROR
+            else:
+                printstatus = PrintStatus.WARN
+        elif filestatus == FileStatus.ORPHAN:
+            if fatstatus == FatStatus.MISSING:
+                printstatus = PrintStatus.ERROR
+            else:
+                printstatus = PrintStatus.WARN
+        else:
+            printstatus = PrintStatus.DEFAULT
+        print_status(printstatus, '%s %s %s' % (status, fat or obj, filename))
+
+    OK_STATUS = '-' * 11
+    def encode_status(self, filestatus, fatstatus):
+        if filestatus == FileStatus.OK and fatstatus == FatStatus.OK:
+            return GitFat.OK_STATUS
+        else:
+            return 'x-%s-%s' % (filestatus, fatstatus)
+    def decode_status(self, status):
+        if status == GitFat.OK_STATUS:
+            return (FileStatus.OK, FatStatus.OK)
+        else:
+            filestatus = FileStatus.byname[status[2:6]] or FileStatus.OK
+            fatstatus = FatStatus.byname[status[7:11]] or FatStatus.OK
+            return (filestatus, fatstatus)
+
     def orphan_files(self, patterns=[]):
         'generator for all orphan placeholders in the working tree'
         if not patterns or patterns == ['']:
@@ -707,80 +798,10 @@ class GitFat(object):
             for garbage in garbages:
                 print_fat_with_filename(garbage, indent=6, filename='')
     def status_for_paths(self, paths):
-        def having_fat_filter(input):
-            # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
-            part_index = 0
-            filename = obj = None
-            for line in input:
-                yield 'francis sucks\n'
-                for part in line.split('\x00'):
-                    if not part:
-                        break; # EOF
-                    if part_index == 0:
-                        mode, obj, stage, filename = part.split(None, 3)
-                        if mode.startswith('100'):
-                            filename = filename.rstrip()
-                        else:
-                            filename = obj = None
-                    elif part_index == 1:
-                        if filename and part != 'filter':
-                            filename = obj = None
-                    elif part_index == 2:
-                        if filename and part == 'fat':
-                            yield '%s %s\n' % (obj, filename)
-                    part_index = (part_index + 1) % 3
-        def did_get_metadata_line(line):
-            fat, fatsize, obj, objsize, filename = line.split('\t')
-            if not filename: return
-            if fat:
-                fatfile = os.path.join(self.objdir, fat)
-                fatstatus = FatStatus.OK if os.path.exists(fatfile) else FatStatus.MISSING
-                fat_from_file, fatsize_from_file, filesize = self.decode_file(filename)
-                if fat_from_file:
-                    filestatus = FileStatus.ORPHAN
-                else:
-                    if filesize != int(fatsize):
-                        filestatus = FileStatus.DIFF
-                    else:
-                        filestatus = FileStatus.OK
-                print_fat(fat, filename, fatstatus, filestatus)
-            else:
-                filehash = self.file_hash(filename)
-                if not filehash or not os.path.exists(os.path.join(self.objdir, filehash)):
-                    print_fat(filehash, filename, FatStatus.NOTFAT, FileStatus.NOTFAT)
-                else:
-                    print_fat(filehash, filename, FatStatus.GARBAGE, FileStatus.NOTFAT)
-        def print_fat(hash, fname, fatstatus, filestatus):
-            if fatstatus == FatStatus.MISSING:
-                if filestatus == FileStatus.DIFF:
-                    status = PrintStatus.ERROR
-                else:
-                    status = PrintStatus.WARN
-            elif filestatus == FileStatus.ORPHAN:
-                if fatstatus == FatStatus.MISSING:
-                    status = PrintStatus.ERROR
-                else:
-                    status = PrintStatus.WARN
-            elif fatstatus == FatStatus.GARBAGE:
-                status = PrintStatus.WARN2
-            elif filestatus == FileStatus.NOTFAT:
-                status = PrintStatus.WARN3
-            else:
-                status = PrintStatus.DEFAULT
-            if status.is_error:
-                status_str = 'x-%s-%s' % (str(filestatus).center(4, '-'), str(fatstatus).center(4, '-'))
-            else:
-                status_str = '-' * 11
-            print_status(status, '%s %s %s' % (status_str, hash, fname))
-
-        paths = [os.path.relpath(os.path.abspath(path), '.') for path in paths]
-        get_metadata = Pipeline.Process(['git','ls-files','-s','-z'] + list(paths)) \
-            .pipe_into('git check-attr --stdin -z filter') \
-            .filter_output(having_fat_filter) \
-            .pipe_into_pipeline(self.objects_from_revlist_pipeline(referenced_only=False, with_filenames=True)) \
-            .start()
+        get_metadata = self.file_status_pipeline(paths).start()
         for line in get_metadata:
-            did_get_metadata_line(line)
+            status, fat, fatsize, obj, objsize, filename = line.split('\t')
+            self.print_file_status(status, fat, obj, filename)
         get_metadata.wait()
         if get_metadata.error: self.verbose(get_metadata.error)
     def is_dirty(self):
@@ -806,7 +827,9 @@ class GitFat(object):
             orphan_files = list(orphan_files)
             orphan = set([orphan_file[0] for orphan_file in orphan_files])
             catalog = self.catalog_objects()
-            self.pull(orphan - catalog)
+            missing = orphan - catalog
+            if missing:
+                self.pull(missing)
         for digest, fname in orphan_files:
             objpath = os.path.join(self.objdir, digest)
             if os.access(objpath, os.R_OK):
@@ -841,14 +864,13 @@ class GitFat(object):
             rev = self.revparse(arg)
             if rev:
                 refargs['rev'] = rev
-        files = self.filter_objects(refargs, self.parse_pull_patterns(args))
-        if files:
+        patterns = self.parse_pull_patterns(args)
+        files = self.filter_objects(refargs, patterns or [''])
+        if files or not patterns:
             self.pull(files)
             self.checkout(files)
     def parse_pull_patterns(self, args):
-        if '--' not in args:
-            return ['']
-        else:
+        if '--' in args:
             idx = args.index('--')
             patterns  = args[idx+1:] #we don't care about '--'
             return patterns
@@ -870,6 +892,29 @@ class GitFat(object):
 
     def cmd_checkout(self, args):
         self.checkout(pull_if_needed=True)
+
+    def cmd_uncache(self, args):
+        candidates = set()
+        get_metadata = self.file_status_pipeline(args).start()
+        for line in get_metadata:
+            status, fat, fatsize, obj, objsize, filename = line.split('\t')
+            filestatus, fatstatus = self.decode_status(status)
+            if filestatus == FileStatus.OK and fatstatus == FatStatus.OK:
+                self.print_file_status(status, fat, obj, filename)
+                candidates.add((fat, filename))
+        get_metadata.wait()
+        if get_metadata.error: self.verbose(get_metadata.error)
+
+        count = len(candidates)
+        if count == 0:
+            print_status(PrintStatus.ERROR, 'No eligible fat files to uncache')
+        else:
+            print_status(PrintStatus.OK, '%i cache file%s will be deleted. Are you sure? [y,N]: ' % (count, 's' if count > 1 else ''), end='')
+            answer = sys.stdin.read(1)
+            if answer.lower() == 'y':
+                for candidate in candidates:
+                    os.remove(os.path.join(self.objdir, candidate[0]))
+                self.status_for_paths([candidate[1] for candidate in candidates])
 
     def cmd_gc(self):
         garbage = self.catalog_objects() - self.referenced_objects()
@@ -1022,8 +1067,10 @@ def main(fat, cmd, args):
         fat.cmd_find(*args)
     elif cmd == 'index-filter':
         fat.cmd_index_filter(args)
+    elif cmd == 'uncache':
+        fat.cmd_uncache(args)
     else:
-        print('Usage: git fat [init|status|push|pull|gc|verify|checkout|find|index-filter] [--verbose]', file=sys.stderr)
+        print('Usage: git fat [init|status|push|pull|gc|verify|checkout|find|index-filter|uncache] [--verbose]', file=sys.stderr)
 
 if __name__ == '__main__':
     cmd, verbose, args = (sys.argv[1], '--verbose' in sys.argv, [arg for arg in sys.argv[2:] if arg != '--verbose']) if len(sys.argv) > 1 else ('', False, [])
