@@ -842,8 +842,9 @@ class GitFat(object):
             if rev:
                 refargs['rev'] = rev
         files = self.filter_objects(refargs, self.parse_pull_patterns(args))
-        self.pull(files)
-        self.checkout(files)
+        if files:
+            self.pull(files)
+            self.checkout(files)
     def parse_pull_patterns(self, args):
         if '--' not in args:
             return ['']
