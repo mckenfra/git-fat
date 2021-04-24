@@ -480,7 +480,7 @@ class GitFat(object):
         h = hashlib.new('sha1')
         bytes = 0
         fd, tmpname = tempfile.mkstemp(dir=self.objdir)
-        suffix_for_verbose = ' "%s"' % filename if filename else ''
+        suffix_for_verbose = ' %s' % filename if filename else ''
         try:
             ishanging = False
             cached = False                # changes to True when file is cached
@@ -496,7 +496,7 @@ class GitFat(object):
                             # If previously added without using fat, don't try to convert it to fat now
                             digest, _, filesize = self.decode_index_file(filename)
                             if not digest and filesize > 0:
-                                self.verbose('git-fat filter-clean: skipping because previously added as non-fat file "%s"' % filename)
+                                self.verbose('git-fat filter-clean: skipping because previously added as non-fat file: %s' % filename)
                                 ishanging = True
                                 outstream = outstreamclean
                         firstblock = False
@@ -531,7 +531,7 @@ class GitFat(object):
     def cmd_filter_smudge(self, filename=None):
         self.setup()
         result, bytes = self.decode_stream(sys.stdin)
-        suffix_for_verbose = ' "%s"' % filename if filename else ''
+        suffix_for_verbose = ' %s' % filename if filename else ''
         if isinstance(result, str):       # We got a digest
             objfile = os.path.join(self.objdir, result)
             try:
@@ -675,7 +675,7 @@ class GitFat(object):
     def status_no_paths(self, all=False):
         def print_fat_with_filename(fat, indent=0, obj=None, filename=None):
             indent_str = ' ' * indent if indent > 0 else ''
-            filename_str = '"%s"' % filename if filename else filename if filename is not None else 'obj=%s' % obj if obj else 'file not found'
+            filename_str = filename if filename is not None else 'obj=%s' % obj if obj else 'file not found'
             print('%s%s%s' % (indent_str, fat, (' %s' % filename_str) if filename_str else ''))
         def did_get_metadata_line(line):
             fat, fatsize, obj, objsize, filename = line.split('\t', 4)
@@ -771,7 +771,7 @@ class GitFat(object):
                 status_str = 'x-%s-%s' % (str(filestatus).center(4, '-'), str(fatstatus).center(4, '-'))
             else:
                 status_str = '-' * 11
-            print_status(status, '%s %s "%s"' % (status_str, hash, fname))
+            print_status(status, '%s %s %s' % (status_str, hash, fname))
 
         paths = [os.path.relpath(os.path.abspath(path), '.') for path in paths]
         get_metadata = Pipeline.Process(['git','ls-files','-s','-z'] + list(paths)) \
