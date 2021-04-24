@@ -798,10 +798,16 @@ class GitFat(object):
         p.communicate(input='\x00'.join(files))
         if p.returncode:
             sys.exit(p.returncode)
-    def checkout(self, show_orphans=False):
+    def checkout(self, files=None, pull_if_needed=False):
         'Update any stale files in the present working tree'
         self.assert_init_done()
-        for digest, fname in self.orphan_files():
+        orphan_files = self.orphan_files(files)
+        if pull_if_needed:
+            orphan_files = list(orphan_files)
+            orphan = set([orphan_file[0] for orphan_file in orphan_files])
+            catalog = self.catalog_objects()
+            self.pull(orphan - catalog)
+        for digest, fname in orphan_files:
             objpath = os.path.join(self.objdir, digest)
             if os.access(objpath, os.R_OK):
                 print('Restoring %s -> %s' % (digest, fname))
@@ -821,7 +827,7 @@ class GitFat(object):
                 # permissions.
                 subprocess.check_call(
                     ['git', 'checkout-index', '--index', '--force', fname])
-            elif show_orphans:
+            elif pull_if_needed:
                 print('Data unavailable: %s %s' % (digest,fname))
     def cmd_pull(self, args):
         'Pull anything that I have referenced, but not stored'
@@ -836,14 +842,8 @@ class GitFat(object):
             if rev:
                 refargs['rev'] = rev
         files = self.filter_objects(refargs, self.parse_pull_patterns(args))
-        cmd = self.get_rsync_command(push=False)
-        self.verbose('Executing: %s' % ' '.join(cmd))
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        p.communicate(input='\x00'.join(files))
-        if p.returncode:
-            sys.exit(p.returncode)
-        self.checkout()
-
+        self.pull(files)
+        self.checkout(files)
     def parse_pull_patterns(self, args):
         if '--' not in args:
             return ['']
@@ -851,6 +851,13 @@ class GitFat(object):
             idx = args.index('--')
             patterns  = args[idx+1:] #we don't care about '--'
             return patterns
+    def pull(self, files):
+        cmd = self.get_rsync_command(push=False)
+        self.verbose('Executing: %s' % ' '.join(cmd))
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        p.communicate(input='\x00'.join(files))
+        if p.returncode:
+            sys.exit(p.returncode)
 
     def filter_objects(self, refargs, patterns):
         files = self.referenced_objects(**refargs) - self.catalog_objects()
@@ -861,7 +868,7 @@ class GitFat(object):
         return files & orphans_objects
 
     def cmd_checkout(self, args):
-        self.checkout(show_orphans=True)
+        self.checkout(pull_if_needed=True)
 
     def cmd_gc(self):
         garbage = self.catalog_objects() - self.referenced_objects()
