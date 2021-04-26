@@ -59,7 +59,7 @@ class Enum(object):
         for key in kwargs: setattr(self, key, kwargs[key])
     def __str__(self): return self.name
     @staticmethod
-    def todict(*args): return dict([(enum.name,enum) for enum in args])
+    def todict(*args): return {enum.name: enum for enum in args}
 
 class Style():
     BOLD = '\33[1m'
@@ -84,6 +84,7 @@ class FatStatus(Enum):
 class FileStatus():
     OK      = Enum('here')
     ORPHAN  = Enum('stub')
+    MISSING = Enum('lost')
     DIFF    = Enum('diff')
     NOTFAT  = Enum('thin')
     byname  = Enum.todict(OK, ORPHAN, DIFF, NOTFAT)
@@ -376,7 +377,7 @@ class Pipeline(object):
         pipeline.root.parent = self
         return pipeline
     def filter_output(self, target, use_cache=None):
-        return Pipeline.Filter(target, self, use_cache)
+        return Pipeline.Filter(target, self, use_cache) if target else self
     def will_start_next(self, next):
         if self.plugin.should_start_before_next(next): self.start(next)
     def did_start_next(self, next):
@@ -641,6 +642,9 @@ class GitFat(object):
             self.fat_is_filter = self.filestatus = self.fatstatus = None
         def __str__(self):
             return '%s\t%s\t%s\t%s\t%s' % (self.fathash, self.fatsize, self.objhash, self.objsize, self.filename)
+        def __hash__(self): return self.fathash.__hash__()
+        def __cmp__(self, other): return self.fathash.__cmp__(other)
+        def __eq__(self, other): return self.fathash.__eq__(other)
 
     def fat_for_objhash_pipeline(self, only_fathashes=False, only_fatobjects=False):
         def cut_objhash(input, cache):
@@ -663,10 +667,9 @@ class GitFat(object):
                     if cache: cache.get().objsize = size
                     if objtype == 'blob' and size in self.magiclens:
                         output = objhash + '\n'
-                if output:
-                    yield output
-                elif only_fathashes or only_fatobjects:
+                if not output and (only_fathashes or only_fatobjects):
                     if cache: cache.set(None)
+                yield output
         def fathash_from_file_contents(input, cache):
             # Process metadata + content format provided by `cat-file --batch`
             while True:
@@ -714,7 +717,7 @@ class GitFat(object):
             .pipe_into('git cat-file --batch') \
             .filter_output(fathash_from_file_contents, use_cache=use_cache)
 
-    def full_fat_pipeline(self, paths='.'):
+    def fat_files_pipeline(self, paths=['.']):
         def having_fat_filter(input):
             # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
             part_index = 0
@@ -738,30 +741,9 @@ class GitFat(object):
                     part_index = (part_index + 1) % 3
         def add_status(input):
             for fatobj in input:
-                if not fatobj.filename: continue
-                if fatobj.fathash:
-                    fatfile = os.path.join(self.objdir, fatobj.fathash)
-                    fatstatus = FatStatus.OK if os.path.exists(fatfile) else FatStatus.MISSING
-                    fat_from_file, fatsize_from_file, filesize = self.decode_file(fatobj.filename)
-                    if fat_from_file:
-                        filestatus = FileStatus.ORPHAN
-                    else:
-                        if filesize != fatobj.fatsize:
-                            filestatus = FileStatus.DIFF
-                        else:
-                            filestatus = FileStatus.OK
-                else:
-                    filestatus = FileStatus.NOTFAT
-                    filehash = self.file_hash(fatobj.filename)
-                    if filehash and os.path.exists(os.path.join(self.objdir, fatobj.objhash)):
-                        fatstatus = FatStatus.GARBAGE
-                    else:
-                        fatstatus = FatStatus.NOTFAT
-                status = self.encode_status(filestatus, fatstatus)
-                fatobj.fatstatus = fatstatus
-                fatobj.filestatus = filestatus
-                fatobj.status = status
+                self.update_fatobj_status(fatobj)
                 yield fatobj
+
         paths = [os.path.relpath(os.path.abspath(path), '.') for path in paths]
         return Pipeline.Process(['git','ls-files','-s','-z'] + list(paths)) \
             .pipe_into('git check-attr --stdin -z filter') \
@@ -769,13 +751,13 @@ class GitFat(object):
             .pipe_into_pipeline(self.fat_for_objhash_pipeline()) \
             .filter_output(add_status)
 
-    def print_fatobj(self, fatobj):
+    def print_fatobj(self, fatobj, hide_status=False, indent=''):
         if fatobj.fatstatus == FatStatus.NOTFAT:
             printstatus = PrintStatus.WARN3
         elif fatobj.fatstatus == FatStatus.GARBAGE:
             printstatus = PrintStatus.WARN2
         elif fatobj.fatstatus == FatStatus.MISSING:
-            if fatobj.filestatus == FileStatus.DIFF:
+            if fatobj.filestatus == FileStatus.DIFF or fatobj.filestatus == FileStatus.MISSING:
                 printstatus = PrintStatus.ERROR
             else:
                 printstatus = PrintStatus.WARN
@@ -786,7 +768,43 @@ class GitFat(object):
                 printstatus = PrintStatus.WARN
         else:
             printstatus = PrintStatus.DEFAULT
-        print_status(printstatus, '%s %s %s' % (fatobj.status, fatobj.fathash or fatobj.objhash, fatobj.filename))
+        status = '' if hide_status else fatobj.status
+        print_status(printstatus, '%s%s %s %s' % (indent, status, fatobj.fathash or fatobj.objhash, fatobj.filename))
+
+    def update_fatobj_status(self, fatobj, catalog=None):
+        if fatobj.fathash:
+            if catalog:
+                fatstatus = FileStatus.OK if fatobj.fathash in catalog else FatStatus.MISSING
+            else:
+                fatfile = os.path.join(self.objdir, fatobj.fathash)
+                fatstatus = FatStatus.OK if os.path.exists(fatfile) else FatStatus.MISSING
+            if not fatobj.filename:
+                filestatus = FileStatus.MISSING
+            else:
+                fat_from_file, fatsize_from_file, filesize = self.decode_file(fatobj.filename)
+                if fat_from_file:
+                    filestatus = FileStatus.ORPHAN
+                else:
+                    if filesize == 0:
+                        filestatus = FileStatus.MISSING
+                    elif filesize != fatobj.fatsize:
+                        filestatus = FileStatus.DIFF
+                    else:
+                        filestatus = FileStatus.OK
+        else:
+            filestatus = FileStatus.NOTFAT
+            if not fatobj.filename:
+                filestatus = FileStatus.MISSING
+            else:
+                filehash = self.file_hash(fatobj.filename)
+                if filehash and os.path.exists(os.path.join(self.objdir, fatobj.objhash)):
+                    fatstatus = FatStatus.GARBAGE
+                else:
+                    fatstatus = FatStatus.NOTFAT
+        status = self.encode_status(filestatus, fatstatus)
+        fatobj.fatstatus = fatstatus
+        fatobj.filestatus = filestatus
+        fatobj.status = status
 
     OK_STATUS = '-' * 11
     def encode_status(self, filestatus, fatstatus):
@@ -819,44 +837,36 @@ class GitFat(object):
         else:
             self.status_no_paths(all=False)
     def status_no_paths(self, all=False):
-        hash2obj = dict()
-        def print_fat_with_filename(fat, indent=0, obj=None, filename=None):
-            indent_str = ' ' * indent if indent > 0 else ''
-            filename_str = filename if filename is not None else 'obj=%s' % obj if obj else 'file not found'
-            print('%s%s%s' % (indent_str, fat, (' %s' % filename_str) if filename_str else ''))
-        def fatobject_to_hash(input):
-            for fatobject in input:
-                print_fat_with_filename(fatobject.fathash, obj=fatobject.objhash, filename=fatobject.filename)
-                if fatobject.fathash:
-                    hash2obj[fatobject.fathash] = fatobject
-                    yield fatobject.fathash
         load_catalog = ThreadWithResult(name='catalog', target=lambda : self.catalog_objects())
         load_catalog.daemon = True
         load_catalog.start()
-        if all:
-            load_referenced = self.fatobjects_pipeline() \
-                .filter_output(fatobject_to_hash) \
-                .start()
-        else:
-            load_referenced = self.fathashes_pipeline().start()
-        referenced = {x for x in load_referenced}
-        load_referenced.wait()
+        load_referenced = self.fatobjects_pipeline().start()
         load_catalog.join()
-        if load_referenced.error: self.verbose(load_referenced.error)
         catalog = load_catalog.result
-        orphans = referenced - catalog
-        garbages = catalog - referenced
-        if orphans:
-            print('Orphan objects:')
-            for orphan in orphans:
-                filename = hash2obj[orphan].filename if hash2obj else ''
-                print_fat_with_filename(orphan, indent=6, filename=filename)
-        if garbages:
-            print('Garbage objects:')
-            for garbage in garbages:
-                print_fat_with_filename(garbage, indent=6, filename='')
+        if all:
+            for fatobj in load_referenced:
+                self.update_fatobj_status(fatobj, catalog=catalog)
+                self.print_fatobj(fatobj)
+            load_referenced.wait()
+            if load_referenced.error: self.verbose(load_referenced.error)
+        else:
+            referenced = {x for x in load_referenced}
+            load_referenced.wait()
+            if load_referenced.error: self.verbose(load_referenced.error)
+            orphans = referenced - catalog
+            garbages = catalog - referenced
+            indent = ' ' * 12
+            if orphans:
+                print_status(PrintStatus.WARN, 'Orphan objects:')
+                for orphan in orphans:
+                    self.update_fatobj_status(orphan, catalog=catalog)
+                    self.print_fatobj(orphan, hide_status=True, indent=indent)
+            if garbages:
+                print_status(PrintStatus.WARN2, 'Garbage objects:')
+                for garbage in garbages:
+                    print_status(PrintStatus.WARN2, '%s%s' % (indent, garbage))
     def status_for_paths(self, paths):
-        get_objects = self.full_fat_pipeline(paths).start()
+        get_objects = self.fat_files_pipeline(paths).start()
         for fatobj in get_objects:
             self.print_fatobj(fatobj)
         get_objects.wait()
@@ -952,7 +962,7 @@ class GitFat(object):
 
     def cmd_uncache(self, args):
         candidates = set()
-        get_objects = self.full_fat_pipeline(args).start()
+        get_objects = self.fat_files_pipeline(args).start()
         for fatobj in get_objects:
             if fatobj.filestatus == FileStatus.OK and fatobj.fatstatus == FatStatus.OK:
                 self.print_fatobj(fatobj)
