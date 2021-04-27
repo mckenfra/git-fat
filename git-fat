@@ -17,6 +17,9 @@ import collections
 import unicodedata
 import traceback
 import weakref
+import argparse
+import fnmatch
+import re
 try:
     import Queue # Python 2
 except ImportError:
@@ -58,8 +61,6 @@ class Enum(object):
         self.name = name
         for key in kwargs: setattr(self, key, kwargs[key])
     def __str__(self): return self.name
-    @staticmethod
-    def todict(*args): return {enum.name: enum for enum in args}
 
 class Style():
     BOLD = '\33[1m'
@@ -79,7 +80,7 @@ class FatStatus(Enum):
     MISSING = Enum('lost')
     GARBAGE = Enum('junk')
     NOTFAT  = Enum('----')
-    byname  = Enum.todict(OK, MISSING, GARBAGE, NOTFAT)
+    byname  = {e.name: e for e in [OK, MISSING, GARBAGE, NOTFAT]}
 
 class FileStatus():
     OK      = Enum('here')
@@ -87,7 +88,7 @@ class FileStatus():
     MISSING = Enum('lost')
     DIFF    = Enum('diff')
     NOTFAT  = Enum('thin')
-    byname  = Enum.todict(OK, ORPHAN, DIFF, NOTFAT)
+    byname  = {e.name: e for e in [OK, ORPHAN, MISSING, DIFF, NOTFAT]}
 
 class PrintStatus():
     DEFAULT = Enum('default', is_error=False, style=None)
@@ -186,6 +187,15 @@ def gitconfig_set(name, value, file=None):
         args += ['--file', file]
     args += [name, value]
     p = subprocess.check_call(args)
+
+class NewlineHelpFormatter(argparse.HelpFormatter):
+    '''
+    Preserve newlines in argparse.add_argument help text
+    '''
+    def _split_lines(self, text, width):
+        if '\n' in text:
+            return text.splitlines()
+        return argparse.HelpFormatter._split_lines(self, text, width)
 
 class ThreadWithResult(threading.Thread):
     def __init__(self, *args, **kwargs):
@@ -751,7 +761,7 @@ class GitFat(object):
             .pipe_into_pipeline(self.fat_for_objhash_pipeline()) \
             .filter_output(add_status)
 
-    def print_fatobj(self, fatobj, hide_status=False, indent=''):
+    def print_fatobj(self, fatobj):
         if fatobj.fatstatus == FatStatus.NOTFAT:
             printstatus = PrintStatus.WARN3
         elif fatobj.fatstatus == FatStatus.GARBAGE:
@@ -768,8 +778,8 @@ class GitFat(object):
                 printstatus = PrintStatus.WARN
         else:
             printstatus = PrintStatus.DEFAULT
-        status = '' if hide_status else fatobj.status
-        print_status(printstatus, '%s%s %s %s' % (indent, status, fatobj.fathash or fatobj.objhash, fatobj.filename))
+        status = fatobj.status or OK_STATUS
+        print_status(printstatus, '%s %s %s' % (status, fatobj.fathash or fatobj.objhash, fatobj.filename))
 
     def update_fatobj_status(self, fatobj, catalog=None):
         if fatobj.fathash:
@@ -805,6 +815,19 @@ class GitFat(object):
         fatobj.fatstatus = fatstatus
         fatobj.filestatus = filestatus
         fatobj.status = status
+        return fatobj
+    def fatobj_filestatus_filter(self, pattern):
+        if pattern:
+            regex = re.compile(fnmatch.translate('[%s]*' % pattern))
+            return lambda x : x if regex.match(x.filestatus.name) else None
+        else:
+            return lambda x : x
+    def fatobj_fatstatus_filter(self, pattern):
+        if pattern:
+            regex = re.compile(fnmatch.translate('[%s]*' % pattern))
+            return lambda x : x if regex.match(x.fatstatus.name) else None
+        else:
+            return lambda x : x
 
     OK_STATUS = '-' * 11
     def encode_status(self, filestatus, fatstatus):
@@ -830,45 +853,55 @@ class GitFat(object):
                 yield (digest, fname)
 
     def cmd_status(self, args):
-        if '--all' in args:
-            self.status_no_paths(all=True)
-        elif args:
-            self.status_for_paths(args)
+        parser = argparse.ArgumentParser(prog='git fat status', formatter_class=NewlineHelpFormatter)
+        parser.add_argument('--all', action='store_true', help='Show all fat objects ever committed to this repository')
+        parser.add_argument('--filestatus', help='Include only objects whose file status has any of the specified characters as its first letter\n\nFILESTATUS: %s' % ', '.join('[%s]%s' % (x[0], x[1:]) for x in FileStatus.byname.keys()))
+        parser.add_argument('--fatstatus', help='Include only objects whose fat status has any of the specified characters as its first letter\n\nFATSTATUS: %s' % ', '.join('[%s]%s' % (x[0], x[1:]) for x in FatStatus.byname.keys()))
+        parser.add_argument('paths', nargs=argparse.REMAINDER, help='Show status for only the specified paths in the working tree.\nIf a directory path is specified, all nested files and subdirectories are searched.')
+        arg = parser.parse_args(args)
+        if arg.paths:
+            self.status_for_paths(arg.paths, filestatus=arg.filestatus, fatstatus=arg.fatstatus)
         else:
-            self.status_no_paths(all=False)
-    def status_no_paths(self, all=False):
+            all = arg.all or arg.filestatus or arg.fatstatus
+            self.status_no_paths(all=all, filestatus=arg.filestatus, fatstatus=arg.fatstatus)
+    def status_no_paths(self, all=False, filestatus=None, fatstatus=None):
         load_catalog = ThreadWithResult(name='catalog', target=lambda : self.catalog_objects())
         load_catalog.daemon = True
         load_catalog.start()
         load_referenced = self.fatobjects_pipeline().start()
         load_catalog.join()
         catalog = load_catalog.result
+        filestatus = self.fatobj_filestatus_filter(filestatus)
+        fatstatus = self.fatobj_fatstatus_filter(fatstatus)
+        def filter_status(fatobj):
+            self.update_fatobj_status(fatobj, catalog=catalog)
+            return fatobj if filestatus(fatobj) and fatstatus(fatobj) else None
         if all:
             for fatobj in load_referenced:
-                self.update_fatobj_status(fatobj, catalog=catalog)
-                self.print_fatobj(fatobj)
+                if filter_status(fatobj): self.print_fatobj(fatobj)
             load_referenced.wait()
             if load_referenced.error: self.verbose(load_referenced.error)
         else:
             referenced = {x for x in load_referenced}
             load_referenced.wait()
             if load_referenced.error: self.verbose(load_referenced.error)
-            orphans = referenced - catalog
+            orphans = {x for x in (filter_status(y) for y in referenced - catalog) if x}
             garbages = catalog - referenced
-            indent = ' ' * 12
             if orphans:
                 print_status(PrintStatus.WARN, 'Orphan objects:')
                 for orphan in orphans:
-                    self.update_fatobj_status(orphan, catalog=catalog)
-                    self.print_fatobj(orphan, hide_status=True, indent=indent)
+                    self.print_fatobj(orphan)
             if garbages:
                 print_status(PrintStatus.WARN2, 'Garbage objects:')
+                indent = ' ' * 12
                 for garbage in garbages:
                     print_status(PrintStatus.WARN2, '%s%s' % (indent, garbage))
-    def status_for_paths(self, paths):
+    def status_for_paths(self, paths, filestatus=None, fatstatus=None):
+        filestatus = self.fatobj_filestatus_filter(filestatus)
+        fatstatus = self.fatobj_fatstatus_filter(fatstatus)
         get_objects = self.fat_files_pipeline(paths).start()
         for fatobj in get_objects:
-            self.print_fatobj(fatobj)
+            if filestatus(fatobj) and fatstatus(fatobj): self.print_fatobj(fatobj)
         get_objects.wait()
         if get_objects.error: self.verbose(get_objects.error)
     def is_dirty(self):
