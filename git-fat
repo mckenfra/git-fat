@@ -1035,7 +1035,11 @@ class GitFat(object):
             else:
                 plural = 's' if count > 1 else ''
                 print_status(PrintStatus.OK, '%i cache file%s will be deleted. Are you sure? [y,N]: ' % (count, plural), end='')
-                answer = sys.stdin.read(1)
+                answer = ''
+                try:
+                    answer = sys.stdin.read(1)
+                except:
+                    pass
                 if answer.lower() == 'y':
                     for fatobj in candidates:
                         os.remove(os.path.join(self.objdir, fatobj.fathash))
