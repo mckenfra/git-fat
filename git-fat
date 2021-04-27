@@ -459,14 +459,21 @@ class GitFat(object):
         if remote is None:
             raise RuntimeError('No rsync.remote in %s' % cfgpath)
         return remote, ssh_port, ssh_user, options
-    def get_rsync_command(self,push):
+    def get_rsync_command(self,push,list_only=False):
         (remote, ssh_port, ssh_user, options) = self.get_rsync()
-        if push:
+        if list_only:
+            self.verbose('Querying %s' % (remote))
+        elif push:
             self.verbose('Pushing to %s' % (remote))
         else:
             self.verbose('Pulling from %s' % (remote))
 
-        cmd = ['rsync', '--progress', '--ignore-existing', '--from0', '--files-from=-']
+        cmd = ['rsync', '--from0', '--files-from=-']
+        if list_only:
+            cmd.append('--list-only')
+#             cmd += ['-nr','--out-format=\'\%n\'','--dry-run']
+        else:
+            cmd += ['--progress', '--ignore-existing']
         rshopts = ''
         if ssh_user:
             rshopts += ' -l ' + ssh_user
@@ -994,12 +1001,8 @@ class GitFat(object):
         self.checkout(pull_if_needed=True)
 
     def cmd_uncache(self, args):
-        candidates = set()
         get_objects = self.fat_files_pipeline(args).start()
-        for fatobj in get_objects:
-            if fatobj.filestatus == FileStatus.OK and fatobj.fatstatus == FatStatus.OK:
-                self.print_fatobj(fatobj)
-                candidates.add(fatobj)
+        candidates = {obj.fathash:obj for obj in get_objects if obj.filestatus == FileStatus.OK and obj.fatstatus == FatStatus.OK}
         get_objects.wait()
         if get_objects.error: self.verbose(get_objects.error)
 
@@ -1007,14 +1010,38 @@ class GitFat(object):
         if count == 0:
             print_status(PrintStatus.ERROR, 'No eligible fat files to uncache')
         else:
-            print_status(PrintStatus.OK, '%i cache file%s will be deleted. Are you sure? [y,N]: ' % (count, 's' if count > 1 else ''), end='')
-            answer = sys.stdin.read(1)
-            if answer.lower() == 'y':
-                for fatobj in candidates:
-                    os.remove(os.path.join(self.objdir, fatobj.fathash))
-                self.status_for_paths([fatobj.filename for fatobj in candidates])
+            plural = 's' if count > 1 else ''
+            self.verbose('%i candidate cache file%s found. Checking they exist on remote...' % (count, plural))
+            exists_on_remote = set()
+            cmd = self.get_rsync_command(push=False, list_only=True)
+            self.verbose('Executing: %s' % ' '.join(cmd))
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open('/dev/null', 'w'))
+            p.stdin.write('\x00'.join(candidates.keys()))
+            p.stdin.close()
+            for line in p.stdout:
+                parts = line.rstrip().rsplit(None, 1)
+                if len(parts) > 1:
+                    fathash = parts[1]
+                    if fathash:
+                        found_candidate = candidates[fathash]
+                        self.print_fatobj(found_candidate)
+                        exists_on_remote.add(found_candidate)
+            p.wait()
+
+            candidates = exists_on_remote
+            count = len(candidates)
+            if count == 0:
+                print_status(PrintStatus.ERROR, 'No eligible fat files to uncache')
             else:
-                print_status(PrintStatus.DEFAULT, 'No changes performed')
+                plural = 's' if count > 1 else ''
+                print_status(PrintStatus.OK, '%i cache file%s will be deleted. Are you sure? [y,N]: ' % (count, plural), end='')
+                answer = sys.stdin.read(1)
+                if answer.lower() == 'y':
+                    for fatobj in candidates:
+                        os.remove(os.path.join(self.objdir, fatobj.fathash))
+                    self.status_for_paths([fatobj.filename for fatobj in candidates])
+                else:
+                    print_status(PrintStatus.DEFAULT, 'No changes performed')
 
     def cmd_gc(self):
         garbage = self.catalog_objects() - self.referenced_objects()
