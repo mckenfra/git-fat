@@ -116,6 +116,14 @@ def verbose_stderr(*args, **kwargs):
     return print(*args, file=sys.stderr, **kwargs)
 def verbose_ignore(*args, **kwargs):
     pass
+def confirm(message):
+    print_status(PrintStatus.OK, '%s. Are you sure? [y,N]: ' % message, end='')
+    answer = ''
+    try:
+        answer = sys.stdin.read(1)
+    except:
+        pass
+    return answer.lower() == 'y'
 
 def mkdir_p(path):
     import errno
@@ -125,6 +133,35 @@ def mkdir_p(path):
         if exc.errno == errno.EEXIST and os.path.isdir(path):
             pass
         else: raise
+
+def mkdir_no_clash(name, in_dir='.'):
+    import errno
+    i = 0
+    original_path = path = os.path.join(in_dir, name)
+    while True:
+        try:
+            os.mkdir(path)
+            return path
+        except OSError as exc:
+            if exc.errno == errno.EEXIST and os.path.isdir(path) and i < 1000:
+                i += 1
+                path = '%s (%i)' % (original_path, i)
+            else: raise
+
+def symlink_no_clash(src, dst):
+    import errno
+    i = 0
+    dst_parts = None
+    while True:
+        try:
+            os.symlink(src, dst)
+            return dst
+        except OSError as exc:
+            if exc.errno == errno.EEXIST and i < 1000:
+                i += 1
+                if not dst_parts: dst_parts = os.path.splitext(dst)
+                dst = '%s (%i)%s' % (dst_parts[0], i, dst_parts[1])
+            else: raise
 
 def umask():
     """Get umask without changing it."""
@@ -823,18 +860,18 @@ class GitFat(object):
         fatobj.filestatus = filestatus
         fatobj.status = status
         return fatobj
-    def fatobj_filestatus_filter(self, pattern):
-        if pattern:
-            regex = re.compile(fnmatch.translate('[%s]*' % pattern))
-            return lambda x : x if regex.match(x.filestatus.name) else None
-        else:
-            return lambda x : x
-    def fatobj_fatstatus_filter(self, pattern):
-        if pattern:
-            regex = re.compile(fnmatch.translate('[%s]*' % pattern))
-            return lambda x : x if regex.match(x.fatstatus.name) else None
-        else:
-            return lambda x : x
+    def fatobj_status_predicate(self, filestatus=None, fatstatus=None):
+        def make_fatobj_predicate(pattern, attrib_getter):
+            if pattern:
+                regex = re.compile(fnmatch.translate('[%s]*' % pattern))
+                return lambda obj : True if regex.match(attrib_getter(obj).name) else False
+            else: return None
+        def and_predicate(a, b):
+            if a and b: return lambda x : a(x) and b(x)
+            else: return a or b
+        filestatus_predicate = make_fatobj_predicate(filestatus, lambda obj : obj.filestatus)
+        fatstatus_predicate = make_fatobj_predicate(fatstatus, lambda obj : obj.fatstatus)
+        return and_predicate(filestatus_predicate, fatstatus_predicate)
 
     OK_STATUS = '-' * 11
     def encode_status(self, filestatus, fatstatus):
@@ -859,56 +896,53 @@ class GitFat(object):
             if digest:
                 yield (digest, fname)
 
+    def filestatus_arg_help(self): return 'Include only objects whose file status has any of the specified characters as its first letter\n\nFILESTATUS: %s' % ', '.join('[%s]%s' % (x[0], x[1:]) for x in FileStatus.byname.keys())
+    def fatstatus_arg_help(self):  return 'Include only objects whose fat status has any of the specified characters as its first letter\n\nFATSTATUS: %s' % ', '.join('[%s]%s' % (x[0], x[1:]) for x in FatStatus.byname.keys())
+
     def cmd_status(self, args):
         parser = argparse.ArgumentParser(prog='git fat status', formatter_class=NewlineHelpFormatter)
         parser.add_argument('--all', action='store_true', help='Show all fat objects ever committed to this repository')
-        parser.add_argument('--filestatus', help='Include only objects whose file status has any of the specified characters as its first letter\n\nFILESTATUS: %s' % ', '.join('[%s]%s' % (x[0], x[1:]) for x in FileStatus.byname.keys()))
-        parser.add_argument('--fatstatus', help='Include only objects whose fat status has any of the specified characters as its first letter\n\nFATSTATUS: %s' % ', '.join('[%s]%s' % (x[0], x[1:]) for x in FatStatus.byname.keys()))
+        parser.add_argument('--filestatus', help=self.filestatus_arg_help())
+        parser.add_argument('--fatstatus', help=self.fatstatus_arg_help())
         parser.add_argument('paths', nargs=argparse.REMAINDER, help='Show status for only the specified paths in the working tree.\nIf a directory path is specified, all nested files and subdirectories are searched.')
         arg = parser.parse_args(args)
+        fatobj_predicate = self.fatobj_status_predicate(arg.filestatus, arg.fatstatus)
         if arg.paths:
-            self.status_for_paths(arg.paths, filestatus=arg.filestatus, fatstatus=arg.fatstatus)
+            self.status_for_paths(arg.paths, fatobj_predicate=fatobj_predicate)
         else:
-            all = arg.all or arg.filestatus or arg.fatstatus
-            self.status_no_paths(all=all, filestatus=arg.filestatus, fatstatus=arg.fatstatus)
-    def status_no_paths(self, all=False, filestatus=None, fatstatus=None):
-        load_catalog = ThreadWithResult(name='catalog', target=lambda : self.catalog_objects())
-        load_catalog.daemon = True
-        load_catalog.start()
+            self.status_no_paths(all=arg.all, fatobj_predicate=fatobj_predicate)
+    def status_no_paths(self, all=False, fatobj_predicate=None):
         load_referenced = self.fatobjects_pipeline().start()
-        load_catalog.join()
-        catalog = load_catalog.result
-        filestatus = self.fatobj_filestatus_filter(filestatus)
-        fatstatus = self.fatobj_fatstatus_filter(fatstatus)
-        def filter_status(fatobj):
-            self.update_fatobj_status(fatobj, catalog=catalog)
-            return fatobj if filestatus(fatobj) and fatstatus(fatobj) else None
-        if all:
+        catalog = self.catalog_objects()
+        if all or fatobj_predicate:
+            # Ungrouped - print objects as arrive from pipe
             for fatobj in load_referenced:
-                if filter_status(fatobj): self.print_fatobj(fatobj)
+                self.update_fatobj_status(fatobj, catalog=catalog)
+                if not fatobj_predicate or fatobj_predicate(fatobj): self.print_fatobj(fatobj)
             load_referenced.wait()
             if load_referenced.error: self.verbose(load_referenced.error)
         else:
-            referenced = {x for x in load_referenced}
+            # Grouped - load all objects into memory first
+            referenced = {obj for obj in load_referenced}
             load_referenced.wait()
             if load_referenced.error: self.verbose(load_referenced.error)
-            orphans = {x for x in (filter_status(y) for y in referenced - catalog) if x}
+            orphans = referenced - catalog
             garbages = catalog - referenced
             if orphans:
                 print_status(PrintStatus.WARN, 'Orphan objects:')
                 for orphan in orphans:
+                    self.update_fatobj_status(orphan, catalog=catalog)
                     self.print_fatobj(orphan)
             if garbages:
                 print_status(PrintStatus.WARN2, 'Garbage objects:')
                 indent = ' ' * 12
                 for garbage in garbages:
                     print_status(PrintStatus.WARN2, '%s%s' % (indent, garbage))
-    def status_for_paths(self, paths, filestatus=None, fatstatus=None):
-        filestatus = self.fatobj_filestatus_filter(filestatus)
-        fatstatus = self.fatobj_fatstatus_filter(fatstatus)
+    def status_for_paths(self, paths, fatobj_predicate=None):
+        # Ungrouped - print objects as arrive from pipe
         get_objects = self.fat_files_pipeline(paths).start()
         for fatobj in get_objects:
-            if filestatus(fatobj) and fatstatus(fatobj): self.print_fatobj(fatobj)
+            if not fatobj_predicate or fatobj_predicate(fatobj): self.print_fatobj(fatobj)
         get_objects.wait()
         if get_objects.error: self.verbose(get_objects.error)
     def is_dirty(self):
@@ -1034,18 +1068,46 @@ class GitFat(object):
                 print_status(PrintStatus.ERROR, 'No eligible fat files to uncache')
             else:
                 plural = 's' if count > 1 else ''
-                print_status(PrintStatus.OK, '%i cache file%s will be deleted. Are you sure? [y,N]: ' % (count, plural), end='')
-                answer = ''
-                try:
-                    answer = sys.stdin.read(1)
-                except:
-                    pass
-                if answer.lower() == 'y':
+                if confirm('%i cache file%s will be deleted' % (count, plural)):
                     for fatobj in candidates:
                         os.remove(os.path.join(self.objdir, fatobj.fathash))
                     self.status_for_paths([fatobj.filename for fatobj in candidates])
                 else:
                     print_status(PrintStatus.DEFAULT, 'No changes performed')
+
+    def cmd_dump(self, args):
+        parser = argparse.ArgumentParser(prog='git fat dump', formatter_class=NewlineHelpFormatter)
+        parser.add_argument('--filestatus', help=self.filestatus_arg_help())
+        arg = parser.parse_args(args)
+        fatobj_predicate = self.fatobj_status_predicate(filestatus=arg.filestatus)
+
+        if not os.path.exists(self.objdir): return
+        rootdir = os.path.normpath(mkdir_no_clash(os.path.join(self.gitdir, 'fat', 'dump')))
+        rootdir_to_objdir = os.path.join('..', 'objects')
+        print_status(PrintStatus.OK, 'Dumping to %s ...' % rootdir)
+
+        count = 0
+        dumpdir_to_objdir = dict()
+        load_referenced = self.fatobjects_pipeline().start()
+        catalog = self.catalog_objects()
+        for fatobj in load_referenced:
+            if fatobj.filename and fatobj in catalog:
+                self.update_fatobj_status(fatobj, catalog=catalog)
+                if not fatobj_predicate or fatobj_predicate(fatobj):
+                    dirname = os.path.dirname(fatobj.filename)
+                    if not dirname in dumpdir_to_objdir:
+                        dumpdir_to_objdir[dirname] = os.path.relpath(rootdir_to_objdir, dirname)
+                        if dirname:
+                            dir_path = os.path.join(rootdir, dirname)
+                            self.verbose('Make dir %s' % dir_path)
+                            mkdir_p(dir_path)
+                    src = os.path.join(dumpdir_to_objdir[dirname], fatobj.fathash)
+                    dst = os.path.join(rootdir, fatobj.filename)
+                    symlink_no_clash(src, dst)
+                    count += 1
+        load_referenced.wait()
+        print_status(PrintStatus.OK, '%i fat files' % count)
+        if count == 0: os.rmdir(rootdir)
 
     def cmd_gc(self):
         garbage = self.catalog_objects() - self.referenced_objects()
@@ -1200,8 +1262,10 @@ def main(fat, cmd, args):
         fat.cmd_index_filter(args)
     elif cmd == 'uncache':
         fat.cmd_uncache(args)
+    elif cmd == 'dump':
+        fat.cmd_dump(args)
     else:
-        print('Usage: git fat [init|status|push|pull|gc|verify|checkout|find|index-filter|uncache] [--verbose]', file=sys.stderr)
+        print('Usage: git fat [init|status|push|pull|gc|verify|checkout|find|index-filter|uncache|dump] [--verbose]', file=sys.stderr)
 
 if __name__ == '__main__':
     cmd, verbose, args = (sys.argv[1], '--verbose' in sys.argv, [arg for arg in sys.argv[2:] if arg != '--verbose']) if len(sys.argv) > 1 else ('', False, [])
