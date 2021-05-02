@@ -55,6 +55,7 @@ except ImportError:
     subprocess.check_output = backport_check_output
 
 BLOCK_SIZE = 4096
+FILE_EXTENSION_SIZE = 65
 
 class Enum(object):
     def __init__(self, name, **kwargs):
@@ -470,12 +471,14 @@ class GitFat(object):
         self.objdir = os.path.join(self.gitdir, 'fat', 'objects')
         if os.environ.get('GIT_FAT_VERSION') == '1':
             self.encode = self.encode_v1
-        else:
+        elif os.environ.get('GIT_FAT_VERSION') == '2':
             self.encode = self.encode_v2
+        else:
+            self.encode = self.encode_v3
         def magiclen(enc):
-            return len(enc(hashlib.sha1('dummy').hexdigest(), 5))
+            return len(enc(hashlib.sha1('dummy').hexdigest(), 5, ''))
         self.magiclen = magiclen(self.encode) # Current version
-        self.magiclens = [magiclen(enc) for enc in [self.encode_v1, self.encode_v2]] # All prior versions
+        self.magiclens = [magiclen(enc) for enc in [self.encode_v1, self.encode_v2, self.encode_v3]] # All prior versions
     def setup(self):
         mkdir_p(self.objdir)
     def is_init_done(self):
@@ -508,7 +511,6 @@ class GitFat(object):
         cmd = ['rsync', '--from0', '--files-from=-']
         if list_only:
             cmd.append('--list-only')
-#             cmd += ['-nr','--out-format=\'\%n\'','--dry-run']
         else:
             cmd += ['--progress', '--ignore-existing']
         rshopts = ''
@@ -533,14 +535,22 @@ class GitFat(object):
             return h.hexdigest()
         except OSError:
             return None
+    def fatname(self, digest, fname, with_padding=False):
+        extension = os.path.splitext(fname)[1].lower()[:FILE_EXTENSION_SIZE] if fname else ''
+        if with_padding: extension = extension.ljust(FILE_EXTENSION_SIZE)
+        return digest + extension
     def revparse(self, revname):
         return subprocess.check_output(['git', 'rev-parse', revname]).strip()
-    def encode_v1(self, digest, bytes):
+    def encode_v1(self, digest, bytes, filename):
         'Produce legacy representation of file to be stored in repository.'
         return '#$# git-fat %s\n' % (digest,)
-    def encode_v2(self, digest, bytes):
-        'Produce representation of file to be stored in repository. 20 characters can hold 64-bit integers.'
+    def encode_v2(self, digest, bytes, filename):
+        'Produce representation of file to be stored in repository. Bytes: 20 characters can hold 64-bit integers.'
         return '#$# git-fat %s %20d\n' % (digest, bytes)
+    def encode_v3(self, digest, bytes, filename):
+        'Produce representation of file to be stored in repository. Bytes: 20 characters can hold 64-bit integers. Include file extension (max 64 characters).'
+        fatname = self.fatname(digest, filename, with_padding=True)
+        return '#$# git-fat %s %20d\n' % (fatname, bytes)
     def decode(self, string, noraise=False):
         cookie = '#$# git-fat '
         if string.startswith(cookie):
@@ -630,7 +640,8 @@ class GitFat(object):
                     outstream.write(block)
                 outstream.flush()
             digest = h.hexdigest()
-            objfile = os.path.join(self.objdir, digest)
+            fatname = self.fatname(digest, filename)
+            objfile = os.path.join(self.objdir, fatname)
             if not ishanging:
                 if os.path.exists(objfile):
                     self.verbose('git-fat filter-clean: cache already exists %s%s' % (objfile, suffix_for_verbose))
@@ -641,7 +652,7 @@ class GitFat(object):
                     os.rename(tmpname, objfile)
                     self.verbose('git-fat filter-clean: caching to %s%s' % (objfile, suffix_for_verbose))
                 cached = True
-                outstreamclean.write(self.encode(digest, bytes))
+                outstreamclean.write(self.encode(digest, bytes, filename))
         finally:
             if not cached:
                 os.remove(tmpname)
@@ -674,105 +685,49 @@ class GitFat(object):
         except OSError:
             return set()
     def referenced_objects(self, rev=None, all=False):
-        get_referenced = self.fathashes_pipeline(rev, all).start()
-        result = {x for x in get_referenced}
-        get_referenced.wait()
-        if get_referenced.error: self.verbose(get_referenced.error)
+        get_fatnames = self.fatnames_pipeline(rev, all).start()
+        result = {x.fatname for x in get_fatnames}
+        get_fatnames.wait()
+        if get_fatnames.error: self.verbose(get_fatnames.error)
         return result
-    def fathashes_pipeline(self, rev=None, all=False):
+    def fatnames_pipeline(self, rev=None, all=False):
         if all:
             rev = '--all'
         elif rev is None:
             rev = self.revparse('HEAD')
-        return Pipeline.Process(['git','rev-list','--objects',rev]) \
-            .pipe_into_pipeline(self.fat_for_objhash_pipeline(only_fathashes=True))
+        return self.revlist_to_obj_pipeline(rev, GitFat.FatName) \
+            .pipe_into_pipeline(self.load_fat_attributes_pipeline(only_fatnames=True))
     def fatobjects_pipeline(self):
-        return Pipeline.Process(['git','rev-list','--objects','--all']) \
-            .pipe_into_pipeline(self.fat_for_objhash_pipeline(only_fatobjects=True))
+        return self.revlist_to_obj_pipeline('--all', GitFat.FatObject) \
+            .pipe_into_pipeline(self.load_fat_attributes_pipeline(only_fatobjects=True))
 
-    class FatObject(object):
-        def __init__(self):
-            self.fathash = self.fatsize = self.objhash = self.objsize = self.filename = \
-            self.fat_is_filter = self.filestatus = self.fatstatus = None
-        def __str__(self):
-            return '%s\t%s\t%s\t%s\t%s' % (self.fathash, self.fatsize, self.objhash, self.objsize, self.filename)
-        def __hash__(self): return self.fathash.__hash__()
-        def __cmp__(self, other): return self.fathash.__cmp__(other)
-        def __eq__(self, other): return self.fathash.__eq__(other)
+    class FatName(object):
+        __slots__ = 'objhash', 'filename', 'fatname'
+        def __init__(self, objhash, filename):
+            self.objhash = objhash
+            self.filename = filename
+            self.fatname = ''
+        def __str__(self): return '\t'.join(self.fatname, self.objhash, self.filename)
+        def __hash__(self): return self.fatname.__hash__()
+        def __cmp__(self, other): return self.fatname.__cmp__(other)
+        def __eq__(self, other): return self.fatname.__eq__(other)
 
-    def fat_for_objhash_pipeline(self, only_fathashes=False, only_fatobjects=False):
-        def cut_objhash(input, cache):
+    class FatObject(FatName):
+        __slots__ = 'fatsize', 'objsize', 'filestatus', 'fatstatus', 'status'
+        def __str__(self): return '\t'.join(self.fatname, self.fatsize, self.objhash, self.objsize, self.filename)
+
+    def revlist_to_obj_pipeline(self, rev, obj_class=None):
+        if not obj_class: obj_class = GitFat.FatObject
+        def to_obj(input):
             for line in input:
                 parts = line.split(None, 1) # objhash, filename_with_spaces_and_newline
-                objhash = parts[0]
-                if cache:
-                    fatobj = GitFat.FatObject()
-                    fatobj.objhash = objhash
-                    if len(parts) > 1: fatobj.filename = parts[1].rstrip()
-                    cache.set(fatobj)
-                yield objhash + '\n'
-        def filter_gitfat_candidates(input, cache):
-            for line in input:
-                output = None
-                parts = line.split() # objhash, objtype, size, \n
-                if len(parts) >= 3:
-                    objhash, objtype, size_str = parts
-                    size = int(size_str)
-                    if cache: cache.get().objsize = size
-                    if objtype == 'blob' and size in self.magiclens:
-                        output = objhash + '\n'
-                if not output and (only_fathashes or only_fatobjects):
-                    if cache: cache.set(None)
-                yield output
-        def fathash_from_file_contents(input, cache):
-            # Process metadata + content format provided by `cat-file --batch`
-            while True:
-                metadata_line = input.readline()
-                if not metadata_line:
-                    break  # EOF
-                objhash, objtype, size_str = metadata_line.split()
-                size, bytes_read = int(size_str), 0
-                # We know from filter that item is a candidate git-fat object and
-                # is small enough to read into memory and process
-                content = ''
-                while bytes_read < size:
-                    data = input.read(size - bytes_read)
-                    if not data:
-                        break  # EOF
-                    content += data
-                    bytes_read += len(data)
-                try:
-                    fathash, fatsize = self.decode(content)
-                    if cache:
-                        fatobj = cache.get()
-                        fatobj.fathash = fathash
-                        fatobj.fatsize = fatsize
-                    yield fathash
-                except GitFat.DecodeError:
-                    self.verbose('decode error: %s' % objhash)
-                    yield None
-                # Consume LF record delimiter in `cat-file --batch` output
-                bytes_read = 0
-                while bytes_read < 1:
-                    data = input.read(1)
-                    if not data:
-                        break  # EOF
-                    bytes_read += len(data)
+                yield obj_class(parts[0], parts[1].rstrip() if len(parts) > 1 else '')
+        return Pipeline.Process(['git','rev-list','--objects',rev]) \
+            .filter_output(to_obj)
 
-        # 1. Cut hash from revlist input
-        # 2. Get info for git-fat candidates in bulk
-        # 3. Analyse info to identify git-fat candidates
-        # 4. Get full contents of identified git-fat candidates in bulk
-        # 5. Extract fathash using file metadata and contents
-        use_cache = not only_fathashes
-        return Pipeline.Filter(cut_objhash, use_cache=use_cache) \
-            .pipe_into('git cat-file --batch-check') \
-            .filter_output(filter_gitfat_candidates, use_cache=use_cache) \
-            .pipe_into('git cat-file --batch') \
-            .filter_output(fathash_from_file_contents, use_cache=use_cache)
-
-    def fat_files_pipeline(self, paths=['.']):
-        def having_fat_filter(input):
+    def filelist_to_obj_pipeline(self, paths, obj_class=None):
+        if not obj_class: obj_class = GitFat.FatObject
+        def fat_filter_to_obj(input):
             # Input format = [mode] [obj] [stage] [filename] \x00 filter \x00 fat \x00
             part_index = 0
             filename = obj = None
@@ -791,19 +746,88 @@ class GitFat(object):
                             filename = obj = None
                     elif part_index == 2:
                         if filename and part == 'fat':
-                            yield '%s %s\n' % (obj, filename)
+                            yield obj_class(obj, filename)
                     part_index = (part_index + 1) % 3
-        def add_status(input):
-            for fatobj in input:
-                self.update_fatobj_status(fatobj)
-                yield fatobj
 
-        paths = [os.path.relpath(os.path.abspath(path), '.') for path in paths]
+        if paths: paths = [os.path.relpath(os.path.abspath(path), '.') for path in paths]
+        else: paths = ['.']
         return Pipeline.Process(['git','ls-files','-s','-z'] + list(paths)) \
             .pipe_into('git check-attr --stdin -z filter') \
-            .filter_output(having_fat_filter) \
-            .pipe_into_pipeline(self.fat_for_objhash_pipeline()) \
-            .filter_output(add_status)
+            .filter_output(fat_filter_to_obj)
+
+    def load_fat_attributes_pipeline(self, only_fatnames=False, only_fatobjects=False):
+        def to_objhash(input, cache):
+            for obj in input:
+                cache.set(obj)
+                yield obj.objhash + '\n'
+        def filter_gitfat_candidates(input, cache):
+            for line in input:
+                output = None
+                parts = line.split() # objhash, objtype, size, \n
+                if len(parts) >= 3:
+                    objhash, objtype, size_str = parts
+                    size = int(size_str)
+                    if objtype == 'blob' and size in self.magiclens:
+                        output = objhash + '\n'
+                        if not only_fatnames: cache.get().objsize = size
+                if not output: cache.set(None)
+                yield output
+        def file_contents_to_fat(input, cache):
+            # Process metadata + content format provided by `cat-file --batch`
+            while True:
+                metadata_line = input.readline()
+                if not metadata_line:
+                    break  # EOF
+                objhash, objtype, size_str = metadata_line.split()
+                size, bytes_read = int(size_str), 0
+                # We know from filter that item is a candidate git-fat object and
+                # is small enough to read into memory and process
+                content = ''
+                while bytes_read < size:
+                    data = input.read(size - bytes_read)
+                    if not data:
+                        break  # EOF
+                    content += data
+                    bytes_read += len(data)
+                try:
+                    fatname, fatsize = self.decode(content)
+                    obj = cache.get()
+                    obj.fatname = fatname
+                    if not only_fatnames: obj.fatsize = fatsize
+                    yield obj
+                except GitFat.DecodeError:
+                    self.verbose('decode error: %s' % objhash)
+                # Consume LF record delimiter in `cat-file --batch` output
+                bytes_read = 0
+                while bytes_read < 1:
+                    data = input.read(1)
+                    if not data:
+                        break  # EOF
+                    bytes_read += len(data)
+
+        # 1. Cut hash from revlist input
+        # 2. Get info for git-fat candidates in bulk
+        # 3. Analyse info to identify git-fat candidates
+        # 4. Get full contents of identified git-fat candidates in bulk
+        # 5. Extract fathash using file metadata and contents
+        return Pipeline.Filter(to_objhash, use_cache=True) \
+            .pipe_into('git cat-file --batch-check') \
+            .filter_output(filter_gitfat_candidates, use_cache=True) \
+            .pipe_into('git cat-file --batch') \
+            .filter_output(file_contents_to_fat, use_cache=True)
+
+    def load_fat_status_pipeline(self):
+        def load_fat_status(input):
+            for fatobj in input:
+                self.load_fat_status(fatobj)
+                yield fatobj
+
+        return Pipeline.Filter(load_fat_status)
+
+    def fat_files_pipeline(self, paths):
+        return self.filelist_to_obj_pipeline(paths) \
+            .pipe_into_pipeline(self.load_fat_attributes_pipeline()) \
+            .pipe_into_pipeline(self.load_fat_status_pipeline())
 
     def print_fatobj(self, fatobj):
         if fatobj.fatstatus == FatStatus.NOTFAT:
@@ -823,14 +847,15 @@ class GitFat(object):
         else:
             printstatus = PrintStatus.DEFAULT
         status = fatobj.status or OK_STATUS
-        print_status(printstatus, '%s %s %s' % (status, fatobj.fathash or fatobj.objhash, fatobj.filename))
+        objhash = fatobj.fatname.split('.')[0] if fatobj.fatname else fatobj.objhash
+        print_status(printstatus, '%s %s %s' % (status, objhash, fatobj.filename))
 
-    def update_fatobj_status(self, fatobj, catalog=None):
-        if fatobj.fathash:
+    def load_fat_status(self, fatobj, catalog=None):
+        if fatobj.fatname:
             if catalog:
-                fatstatus = FileStatus.OK if fatobj.fathash in catalog else FatStatus.MISSING
+                fatstatus = FileStatus.OK if fatobj.fatname in catalog else FatStatus.MISSING
             else:
-                fatfile = os.path.join(self.objdir, fatobj.fathash)
+                fatfile = os.path.join(self.objdir, fatobj.fatname)
                 fatstatus = FatStatus.OK if os.path.exists(fatfile) else FatStatus.MISSING
             if not fatobj.filename:
                 filestatus = FileStatus.MISSING
@@ -860,6 +885,7 @@ class GitFat(object):
         fatobj.filestatus = filestatus
         fatobj.status = status
         return fatobj
+
     def fatobj_status_predicate(self, filestatus=None, fatstatus=None):
         def make_fatobj_predicate(pattern, attrib_getter):
             if pattern:
@@ -917,7 +943,7 @@ class GitFat(object):
         if all or fatobj_predicate:
             # Ungrouped - print objects as arrive from pipe
             for fatobj in load_referenced:
-                self.update_fatobj_status(fatobj, catalog=catalog)
+                self.load_fat_status(fatobj, catalog=catalog)
                 if not fatobj_predicate or fatobj_predicate(fatobj): self.print_fatobj(fatobj)
             load_referenced.wait()
             if load_referenced.error: self.verbose(load_referenced.error)
@@ -931,7 +957,7 @@ class GitFat(object):
             if orphans:
                 print_status(PrintStatus.WARN, 'Orphan objects:')
                 for orphan in orphans:
-                    self.update_fatobj_status(orphan, catalog=catalog)
+                    self.load_fat_status(orphan, catalog=catalog)
                     self.print_fatobj(orphan)
             if garbages:
                 print_status(PrintStatus.WARN2, 'Garbage objects:')
@@ -1036,7 +1062,7 @@ class GitFat(object):
 
     def cmd_uncache(self, args):
         get_objects = self.fat_files_pipeline(args).start()
-        candidates = {obj.fathash:obj for obj in get_objects if obj.filestatus == FileStatus.OK and obj.fatstatus == FatStatus.OK}
+        candidates = {obj.fatname:obj for obj in get_objects if obj.filestatus == FileStatus.OK and obj.fatstatus == FatStatus.OK}
         get_objects.wait()
         if get_objects.error: self.verbose(get_objects.error)
 
@@ -1055,9 +1081,9 @@ class GitFat(object):
             for line in p.stdout:
                 parts = line.rstrip().rsplit(None, 1)
                 if len(parts) > 1:
-                    fathash = parts[1]
-                    if fathash:
-                        found_candidate = candidates[fathash]
+                    objname = parts[1]
+                    if objname and objname in candidates:
+                        found_candidate = candidates[objname]
                         self.print_fatobj(found_candidate)
                         exists_on_remote.add(found_candidate)
             p.wait()
@@ -1070,7 +1096,7 @@ class GitFat(object):
                 plural = 's' if count > 1 else ''
                 if confirm('%i cache file%s will be deleted' % (count, plural)):
                     for fatobj in candidates:
-                        os.remove(os.path.join(self.objdir, fatobj.fathash))
+                        os.remove(os.path.join(self.objdir, fatobj.fatname))
                     self.status_for_paths([fatobj.filename for fatobj in candidates])
                 else:
                     print_status(PrintStatus.DEFAULT, 'No changes performed')
@@ -1092,7 +1118,7 @@ class GitFat(object):
         catalog = self.catalog_objects()
         for fatobj in load_referenced:
             if fatobj.filename and fatobj in catalog:
-                self.update_fatobj_status(fatobj, catalog=catalog)
+                self.load_fat_status(fatobj, catalog=catalog)
                 if not fatobj_predicate or fatobj_predicate(fatobj):
                     dirname = os.path.dirname(fatobj.filename)
                     if not dirname in dumpdir_to_objdir:
@@ -1101,7 +1127,7 @@ class GitFat(object):
                             dir_path = os.path.join(rootdir, dirname)
                             self.verbose('Make dir %s' % dir_path)
                             mkdir_p(dir_path)
-                    src = os.path.join(dumpdir_to_objdir[dirname], fatobj.fathash)
+                    src = os.path.join(dumpdir_to_objdir[dirname], fatobj.fatname)
                     dst = os.path.join(rootdir, fatobj.filename)
                     symlink_no_clash(src, dst)
                     count += 1
