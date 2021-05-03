@@ -3,7 +3,9 @@
 
 from __future__ import print_function, with_statement
 
-import sys
+import sys, signal
+signal.signal(signal.SIGINT, lambda x, y: sys.exit(0))
+
 import hashlib
 import tempfile
 import os
@@ -106,12 +108,16 @@ def print_status(status, *args, **kwargs):
         style = status.style
         file = kwargs['file'] if 'file' in kwargs else None
         end = kwargs.pop('end') if 'end' in kwargs else None
+        flush = kwargs.pop('flush') if 'flush' in kwargs else None
         kwargs['end'] = ''
     else:
         style = None
-    if style: print(style, file=file, end='')
+    if style:
+        print(style, file=file, end='')
     result = print(*args, **kwargs)
-    if style: print(Style.RESET, file=file, end=end)
+    if style:
+        print(Style.RESET, file=file, end=end)
+        if flush: (file or sys.stdout).flush()
     return result
 def verbose_stderr(*args, **kwargs):
     return print(*args, file=sys.stderr, **kwargs)
@@ -183,6 +189,12 @@ def cat_iter(initer, outstream):
         outstream.write(block)
 def cat(instream, outstream):
     return cat_iter(readblocks(instream), outstream)
+def grouper(iterable, n):
+    iterable = iter(iterable)
+    while True:
+        tup = tuple(itertools.islice(iterable, 0, n))
+        if tup: yield tup
+        else: break
 def difftreez_reader(input):
     """Incremental reader for git diff-tree -z output
 
@@ -462,6 +474,7 @@ class Pipeline(object):
 class GitFat(object):
     DecodeError = RuntimeError
     def __init__(self, verbose=False):
+        self.is_verbose = verbose
         self.verbose = verbose_stderr if verbose else verbose_ignore
         try:
             self.gitroot = subprocess.check_output('git rev-parse --show-toplevel'.split()).strip()
@@ -997,28 +1010,42 @@ class GitFat(object):
             missing = orphan - catalog
             if missing:
                 self.pull(missing)
-        for digest, fname in orphan_files:
-            objpath = os.path.join(self.objdir, digest)
-            if os.access(objpath, os.R_OK):
-                print('Restoring %s -> %s' % (digest, fname))
-                # The output of our smudge filter depends on the existence of
-                # the file in .git/fat/objects, but git caches the file stat
-                # from the previous time the file was smudged, therefore it
-                # won't try to re-smudge. I don't know a git command that
-                # specifically invalidates that cache, but changing the mtime
-                # on the file will invalidate the cache.
-                # Here we set the mtime to mtime + 1. This is an improvement
-                # over touching the file as it catches the edgecase where a
-                # git-checkout happens within the same second as a git fat
-                # checkout.
-                stat = os.lstat(fname)
-                os.utime(fname, (stat.st_atime, stat.st_mtime + 1))
-                # This re-smudge is essentially a copy that restores
-                # permissions.
-                subprocess.check_call(
-                    ['git', 'checkout-index', '--index', '--force', fname])
-            elif pull_if_needed:
-                print('Data unavailable: %s %s' % (digest,fname))
+
+        orphan_files_is_accessible = [(digest, fname, os.access(os.path.join(self.objdir, digest), os.R_OK)) for digest, fname in orphan_files]
+        count_accessible = sum(1 for _ in itertools.ifilter(lambda x : x[2], orphan_files_is_accessible))
+
+        count_restored = 0
+        for batch in grouper(orphan_files_is_accessible, 100):
+            for orphan_file in batch:
+                digest, fname, is_accessible = orphan_file
+                if is_accessible:
+                    count_restored += 1
+                    print('Restoring %s -> %s' % (digest, fname))
+                    # The output of our smudge filter depends on the existence of
+                    # the file in .git/fat/objects, but git caches the file stat
+                    # from the previous time the file was smudged, therefore it
+                    # won't try to re-smudge. I don't know a git command that
+                    # specifically invalidates that cache, but touching the file
+                    # also does the trick.
+                    os.utime(fname, None)
+                elif pull_if_needed:
+                    print_status(PrintStatus.ERROR, 'Data unavailable: %s %s' % (digest, fname))
+
+            filenames_nullterm = "\x00".join(x[1] for x in batch if x[2])
+
+            if filenames_nullterm:
+                print_status(PrintStatus.OK, 'Restoring %d of %d Files ... ' % (count_restored, count_accessible), end='', flush=True)
+                # This re-smudge is essentially a copy that restores permissions.
+                cmd = ['git', 'checkout-index', '--stdin', '-z', '--index', '--force']
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                outs, errs = p.communicate(filenames_nullterm)
+                retcode = p.wait()
+                if retcode == 0:
+                    print_status(PrintStatus.OK, 'OK')
+                else:
+                    print_status(PrintStatus.ERROR, 'FAILED', file=sys.stdout)
+                    error = subprocess.CalledProcessError(retcode, " ".join(cmd))
+                    raise error
     def cmd_pull(self, args):
         'Pull anything that I have referenced, but not stored'
         self.setup()
@@ -1058,7 +1085,7 @@ class GitFat(object):
         return files & orphans_objects
 
     def cmd_checkout(self, args):
-        self.checkout(pull_if_needed=True)
+        self.checkout(files=args, pull_if_needed=True)
 
     def cmd_uncache(self, args):
         get_objects = self.fat_files_pipeline(args).start()
@@ -1304,8 +1331,8 @@ if __name__ == '__main__':
         try:
             main(fat, cmd, args)
         except KeyboardInterrupt:
-            sys.exit()
+            pass
         except Exception as e:
             prefix = '[git-fat] ' if cmd == 'filter-clean' or cmd == 'filter-smudge' else ''
-            print('%s%s' % (prefix, e.message or 'An error occurred with type %s' % type(e).__name__), file=sys.stderr)
+            print_status(PrintStatus.ERROR, '%s%s' % (prefix, e.message or 'An error occurred with type %s' % type(e).__name__), file=sys.stderr)
             sys.exit(1)
